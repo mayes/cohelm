@@ -55,7 +55,14 @@ impl BrowserCommand {
     pub(crate) fn base_args(&self) -> Vec<OsString> {
         let mut profile = OsString::from("--user-data-dir=");
         profile.push(&self.profile_dir);
-        let mut args = vec![profile, "--remote-debugging-pipe".into()];
+        // Cohelm's own Setup wizard takes the place of Chromium's first run,
+        // which would otherwise hold the person's pages back behind its
+        // welcome window.
+        let mut args = vec![
+            profile,
+            "--remote-debugging-pipe".into(),
+            "--no-first-run".into(),
+        ];
         if let Some(dir) = &self.extension_dir {
             let mut load = OsString::from("--load-extension=");
             load.push(dir);
@@ -198,6 +205,10 @@ mod tests {
         let args = command.base_args();
         assert_eq!(args[0], "--user-data-dir=/home/ada/.cohelm/profile");
         assert!(args.iter().any(|a| a == "--remote-debugging-pipe"));
+        assert!(
+            args.iter().any(|a| a == "--no-first-run"),
+            "Chromium's first run doesn't hold the pages back"
+        );
         assert!(
             !args
                 .iter()
