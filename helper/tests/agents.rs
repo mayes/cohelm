@@ -57,6 +57,15 @@ async fn a_new_agent_waits_for_the_person_and_a_declined_one_is_refused() {
     let (newcomer, result) = held.await.unwrap();
     let result = result.unwrap();
     assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+    // The person's tab may still be loading, with no address yet.
+    let mut result = result;
+    for _ in 0..50 {
+        if text_of(&result).contains("/sign-in") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        result = list_pages(&newcomer).await.unwrap();
+    }
     assert!(
         text_of(&result).contains("/sign-in"),
         "{}",
