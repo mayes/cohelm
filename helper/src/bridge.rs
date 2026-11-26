@@ -35,9 +35,16 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{browser::LaunchedBrowser, config::HelperError};
 
-/// The Helper's own DevTools commands use ids from here up, so their replies
-/// are told apart from the client's (Puppeteer counts up from 1).
-const OWN_IDS: u64 = 1 << 50;
+/// The Helper's own DevTools commands use ids from here to [`MAX_ID`], and the
+/// ids it gives the client's commands stay below it, so their replies are told
+/// apart.
+const OWN_IDS: u64 = 1 << 30;
+/// Chromium reads a command's id as a 32-bit signed number. A larger id gets
+/// an error with no id at all, so its reply could never be matched.
+const MAX_ID: u64 = i32::MAX as u64;
+/// How long the Helper waits for the browser to answer one of its own
+/// commands.
+const ASK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Large enough for a full-page screenshot.
 const MAX_MESSAGE: usize = 256 << 20;
 /// How long the browser gets to close by itself before it's stopped.
@@ -101,8 +108,9 @@ impl Asker {
         self.events
             .send(Event::Ask(method.to_owned(), params, answer))
             .map_err(|_| HelperError::BrowserClosed)?;
-        answered
+        tokio::time::timeout(ASK_TIMEOUT, answered)
             .await
+            .map_err(|_| HelperError::BrowserUnreachable(format!("no answer to {method}")))?
             .map_err(|_| HelperError::BrowserClosed)?
             .map_err(HelperError::BrowserUnreachable)
     }
@@ -269,7 +277,7 @@ impl Relay {
             client: None,
             pending: HashMap::new(),
             next_id: 0,
-            own_id: OWN_IDS,
+            own_id: OWN_IDS - 1,
             asked: HashMap::new(),
         }
     }
@@ -317,9 +325,7 @@ impl Relay {
             return;
         };
         if let Some(own) = message.get_mut("id") {
-            self.next_id += 1;
-            let relay_id = self.next_id;
-            debug_assert!(relay_id < OWN_IDS);
+            let relay_id = self.next_relay_id();
             self.pending.insert(
                 relay_id,
                 (client_id, std::mem::replace(own, relay_id.into())),
@@ -353,6 +359,11 @@ impl Relay {
             return;
         }
 
+        if let Some(error) = message.get("error") {
+            // The browser couldn't read a command well enough to say which.
+            tracing::warn!("the browser refused a command: {error}");
+            return;
+        }
         let parent = message
             .get("sessionId")
             .and_then(Value::as_str)
@@ -450,14 +461,32 @@ impl Relay {
         .await;
     }
 
+    /// The next id for a client's command: 1 up to just below [`OWN_IDS`],
+    /// then round again.
+    fn next_relay_id(&mut self) -> u64 {
+        self.next_id = self.next_id % (OWN_IDS - 1) + 1;
+        self.next_id
+    }
+
+    /// The next id for one of the Helper's own commands: [`OWN_IDS`] up to
+    /// [`MAX_ID`], then round again.
+    fn next_own_id(&mut self) -> u64 {
+        self.own_id = if self.own_id >= MAX_ID {
+            OWN_IDS
+        } else {
+            self.own_id + 1
+        };
+        self.own_id
+    }
+
     async fn send_own(&mut self, method: &str, params: Value, session: Option<&str>) -> u64 {
-        self.own_id += 1;
-        let mut message = json!({ "id": self.own_id, "method": method, "params": params });
+        let id = self.next_own_id();
+        let mut message = json!({ "id": id, "method": method, "params": params });
         if let Some(session) = session {
             message["sessionId"] = session.into();
         }
         let _ = self.to_pipe.send(message.to_string()).await;
-        self.own_id
+        id
     }
 }
 
@@ -537,6 +566,22 @@ mod tests {
         assert!(!same_secret("abc124", "abc123"));
         assert!(!same_secret("abc12", "abc123"));
         assert!(!same_secret("", "abc123"));
+    }
+
+    #[test]
+    fn ids_stay_within_what_chromium_reads() {
+        let (to_pipe, _outbox) = mpsc::channel(1);
+        let mut relay = Relay::new(to_pipe);
+        assert_eq!(relay.next_relay_id(), 1);
+        assert_eq!(relay.next_own_id(), OWN_IDS);
+        relay.next_id = OWN_IDS - 1;
+        assert_eq!(
+            relay.next_relay_id(),
+            1,
+            "client ids go round below OWN_IDS"
+        );
+        relay.own_id = MAX_ID;
+        assert_eq!(relay.next_own_id(), OWN_IDS, "own ids go round at MAX_ID");
     }
 
     #[test]
