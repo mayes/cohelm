@@ -17,6 +17,8 @@ pub struct HelperConfig {
     pub agents_file: Option<PathBuf>,
     /// How long a new Agent's call is held while the person decides.
     pub approval_wait: Duration,
+    /// How long a Pause waits for the person before it counts as blocked.
+    pub pause_wait: Duration,
     /// How the Helper looks for a newer Cohelm. None never looks.
     pub updates: Option<UpdateCheck>,
 }
@@ -53,6 +55,7 @@ impl HelperConfig {
             browser,
             devtools: DevtoolsCommand::default(),
             approval_wait: Duration::from_secs(60),
+            pause_wait: crate::pauses::PAUSE_WAIT,
             updates: None,
         }
     }

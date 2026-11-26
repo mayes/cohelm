@@ -14,7 +14,8 @@ use serde_json::json;
 
 mod common;
 use common::{
-    EXTENSION_PAGE, TEST_AGENT, args, call, connect_as, helper_config, start_site, test_chrome,
+    EXTENSION_PAGE, TEST_AGENT, allow_next_pause, args, call, connect_as, helper_config,
+    start_site, test_chrome,
 };
 
 #[tokio::test]
@@ -103,12 +104,16 @@ async fn agent_works_in_the_persons_open_tab_on_their_session() {
         !seen.to_lowercase().contains("cohelm"),
         "site sees no Cohelm name:\n{seen}"
     );
-    let own = call(
-        &agent,
-        "evaluate_script",
-        json!({ "pageId": page_id, "function": "() => navigator.userAgent" }),
-    )
-    .await;
+    // A script could do anything, so it waits at a Pause; the person allows
+    // this one.
+    let (own, ()) = tokio::join!(
+        call(
+            &agent,
+            "evaluate_script",
+            json!({ "pageId": page_id, "function": "() => navigator.userAgent" }),
+        ),
+        allow_next_pause(&helper),
+    );
     let own_ua = own
         .lines()
         .find_map(|l| l.trim().strip_prefix('"')?.strip_suffix('"'))

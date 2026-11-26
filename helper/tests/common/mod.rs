@@ -32,6 +32,22 @@ pub type Agent = rmcp::service::RunningService<rmcp::RoleClient, ClientConfig>;
 /// The name the tests' Agent gives itself.
 pub const TEST_AGENT: &str = "cohelm-test-agent";
 
+/// Allow the next Pause, as the person would.
+pub async fn allow_next_pause(helper: &cohelm_helper::RunningHelper) {
+    let mut changed = helper.pauses().watch();
+    let id = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(waiting) = helper.pauses().waiting().first() {
+                return waiting.id;
+            }
+            changed.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("a Pause waits for the person");
+    helper.pauses().answer(id, true);
+}
+
 /// Connect to the Helper as an MCP client called `name`.
 pub async fn connect_as(
     name: &str,
@@ -90,6 +106,21 @@ fn browser_command(chrome: PathBuf, profile: &Path, first_page: &str) -> Browser
     browser
 }
 
+/// A page with one risky button and one plain one. Each shows what it did
+/// in the page, where a snapshot can read it.
+async fn compose() -> impl IntoResponse {
+    axum::response::Html(
+        r#"<h1>Compose</h1>
+<p id="status">Not sent</p>
+<p id="more" hidden>More shown</p>
+<button onclick="document.getElementById('more').hidden = false">Show more</button>
+<button onclick="document.getElementById('status').textContent = 'Message sent'">Send message</button>
+<label>Note <input id="note"></label>
+<button id="next" onclick="document.getElementById('status').textContent = 'Message sent'">Continue</button>
+<button onclick="document.getElementById('next').textContent = 'Post it'">Change wording</button>"#,
+    )
+}
+
 async fn sign_in() -> impl IntoResponse {
     (
         [(header::SET_COOKIE, "session=ada; Path=/; HttpOnly")],
@@ -130,7 +161,8 @@ pub async fn start_site() -> String {
     let app = Router::new()
         .route("/sign-in", get(sign_in))
         .route("/account", get(account))
-        .route("/whoami", get(whoami));
+        .route("/whoami", get(whoami))
+        .route("/compose", get(compose));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

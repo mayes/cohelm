@@ -9,6 +9,7 @@ mod browser;
 mod config;
 mod layout;
 mod pages;
+mod pauses;
 mod server;
 mod updates;
 
@@ -21,5 +22,8 @@ pub use backend::DevtoolsCommand;
 pub use browser::BrowserCommand;
 pub use config::{HelperConfig, HelperError};
 pub use layout::{Layout, Platform};
+pub use pauses::{
+    Answer, Kind, Need, PAUSE_WAIT, Page, Pauses, Step, Verdict, Waiting, classify, need,
+};
 pub use server::{BrowserProbe, RunningHelper, SERVER_NAME, cohelm_at, start};
 pub use updates::{Update, UpdateCheck, newest};

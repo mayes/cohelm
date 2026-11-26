@@ -50,7 +50,16 @@ impl DevtoolsCommand {
         let mut args = self.args.clone();
         args.push("--config".into());
         args.push(config_file.into());
-        args.extend(["--no-usage-statistics", "--no-performance-crux"].map(OsString::from));
+        // Structured content lets the Pause read snapshots as data, not as
+        // text a page could forge lines into.
+        args.extend(
+            [
+                "--no-usage-statistics",
+                "--no-performance-crux",
+                "--experimentalStructuredContent",
+            ]
+            .map(OsString::from),
+        );
         args
     }
 }
@@ -122,7 +131,12 @@ mod tests {
     #[test]
     fn devtools_is_always_told_to_stay_private() {
         let args = DevtoolsCommand::default().args_for(Path::new("/run/cohelm/cdm.json"));
-        for flag in ["--no-usage-statistics", "--no-performance-crux", "--config"] {
+        for flag in [
+            "--no-usage-statistics",
+            "--no-performance-crux",
+            "--experimentalStructuredContent",
+            "--config",
+        ] {
             assert!(args.iter().any(|a| a == flag), "missing {flag}");
         }
         for key in [

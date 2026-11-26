@@ -34,6 +34,7 @@ p { margin: 0 0 12px; }
 .notice p { margin: 0; }
 .notice p + p { margin-top: 6px; }
 .notice a { color: var(--accent); }
+.detail { font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-all; border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 10px; margin: 12px 0; background: var(--surface); max-height: 8em; overflow: auto; }
 .row { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-top: 1px solid var(--line); }
 .row:first-of-type { border-top: 0; }
 .row .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }

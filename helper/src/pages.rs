@@ -1,5 +1,5 @@
-//! Cohelm's own pages in the browser: the prompt where the person allows or
-//! declines a new Agent, and the Agents list.
+//! Cohelm's own pages in the browser: the prompts where the person allows or
+//! declines a new Agent and answers a Pause, and the Agents list.
 //!
 //! The pages belong to Cohelm's built-in extension. The Helper reaches them
 //! over its private DevTools pipe, not over the network: it attaches to each
@@ -20,6 +20,8 @@ use crate::{EXTENSION_ID, bridge::Asker, config::HelperError, server::Control, u
 
 /// The page that asks the person about a new Agent.
 pub(crate) const PROMPT: &str = "allow.html";
+/// The page that asks the person about a risky step.
+pub(crate) const PAUSE: &str = "pause.html";
 /// The function each Cohelm page answers through.
 const BINDING: &str = "cohelmSend";
 /// How often the Helper looks for Cohelm pages it hasn't seen opening.
@@ -52,6 +54,7 @@ pub(crate) async fn run(
     let mut events = browser.watch();
     let mut changed = control.agents.watch();
     let mut update = control.update.subscribe();
+    let mut paused = control.pauses.watch();
     let mut look = tokio::time::interval(LOOK_EVERY);
     loop {
         tokio::select! {
@@ -62,6 +65,12 @@ pub(crate) async fn run(
                     return;
                 }
                 pages.agents_changed().await;
+            }
+            seen = paused.changed() => {
+                if seen.is_err() {
+                    return;
+                }
+                pages.pauses_changed().await;
             }
             seen = update.changed() => {
                 if seen.is_err() {
@@ -86,13 +95,22 @@ struct Pages {
     /// Each Cohelm page the Helper is attached to, by target, with its
     /// session.
     attached: HashMap<String, String>,
-    /// Prompt windows the Helper opened, by target, with the Agent each asks
-    /// about. Only these may answer for that Agent.
-    prompts: HashMap<String, String>,
+    /// Prompt windows the Helper opened, by target, with what each asks
+    /// about. Only these may answer it.
+    prompts: HashMap<String, Prompt>,
     /// Targets the Helper couldn't attach to, with how many times it tried.
     failed: HashMap<String, u32>,
     /// Whether Cohelm's toolbar button shows that an update is out.
     badged: bool,
+}
+
+/// What a prompt window asks the person.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Prompt {
+    /// Whether to allow this new Agent.
+    Agent(String),
+    /// Whether to allow this risky step.
+    Pause(u64),
 }
 
 impl Pages {
@@ -216,10 +234,13 @@ impl Pages {
         // Closing the prompt without answering declines, for now: the Agent
         // is refused until Cohelm restarts or the person allows it from the
         // Agents list.
-        if let Some(name) = self.prompts.remove(target)
-            && self.control.agents.snapshot().asking.contains(&name)
-        {
-            self.control.agents.answer(&name, false);
+        match self.prompts.remove(target) {
+            Some(Prompt::Agent(name)) if self.control.agents.snapshot().asking.contains(&name) => {
+                self.control.agents.answer(&name, false);
+            }
+            // Closing a Pause without answering blocks the step.
+            Some(Prompt::Pause(id)) => self.control.pauses.answer(id, false),
+            _ => {}
         }
     }
 
@@ -229,19 +250,14 @@ impl Pages {
         let answered: Vec<String> = self
             .prompts
             .iter()
-            .filter(|(_, name)| !asking.contains(name))
+            .filter(|(_, p)| matches!(p, Prompt::Agent(name) if !asking.contains(name)))
             .map(|(target, _)| target.clone())
             .collect();
-        for target in answered {
-            self.prompts.remove(&target);
-            let _ = self
-                .browser
-                .ask("Target.closeTarget", json!({ "targetId": target }))
-                .await;
-        }
+        self.close_prompts(answered).await;
         for name in asking {
-            if !self.prompts.values().any(|n| *n == name) {
-                self.open_prompt(&name).await;
+            let prompt = Prompt::Agent(name);
+            if !self.prompts.values().any(|p| *p == prompt) {
+                self.open_prompt(prompt).await;
             }
         }
         self.push_all().await;
@@ -300,13 +316,44 @@ impl Pages {
         }
     }
 
-    async fn open_prompt(&mut self, name: &str) {
+    async fn pauses_changed(&mut self) {
+        let waiting: HashSet<u64> = self.control.pauses.waiting().iter().map(|w| w.id).collect();
+        let answered: Vec<String> = self
+            .prompts
+            .iter()
+            .filter(|(_, p)| matches!(p, Prompt::Pause(id) if !waiting.contains(id)))
+            .map(|(target, _)| target.clone())
+            .collect();
+        self.close_prompts(answered).await;
+        for id in waiting {
+            let prompt = Prompt::Pause(id);
+            if !self.prompts.values().any(|p| *p == prompt) {
+                self.open_prompt(prompt).await;
+            }
+        }
+    }
+
+    async fn close_prompts(&mut self, targets: Vec<String>) {
+        for target in targets {
+            self.prompts.remove(&target);
+            let _ = self
+                .browser
+                .ask("Target.closeTarget", json!({ "targetId": target }))
+                .await;
+        }
+    }
+
+    async fn open_prompt(&mut self, prompt: Prompt) {
+        let page = match prompt {
+            Prompt::Agent(_) => PROMPT,
+            Prompt::Pause(_) => PAUSE,
+        };
         let opened = self
             .browser
             .ask(
                 "Target.createTarget",
                 json!({
-                    "url": format!("{}{PROMPT}", page_prefix()),
+                    "url": format!("{}{page}", page_prefix()),
                     "newWindow": true,
                     "width": 440,
                     "height": 400,
@@ -315,11 +362,15 @@ impl Pages {
             .await;
         match opened.map(|o| o["targetId"].as_str().map(str::to_owned)) {
             Ok(Some(target)) => {
-                self.prompts.insert(target.clone(), name.to_owned());
+                self.prompts.insert(target.clone(), prompt);
                 self.found(&target).await;
             }
             Ok(None) | Err(_) => {
-                tracing::warn!("couldn't open Cohelm's prompt for {name}");
+                tracing::warn!("couldn't open Cohelm's prompt: {prompt:?}");
+                // Nobody can answer a Pause that couldn't be shown.
+                if let Prompt::Pause(id) = prompt {
+                    self.control.pauses.answer(id, false);
+                }
             }
         }
     }
@@ -329,9 +380,12 @@ impl Pages {
         if said["hello"] == true {
             self.push(target).await;
         } else if let Some(allow) = said["allow"].as_bool() {
-            // A prompt answers for the one Agent it asks about.
-            if let Some(name) = self.prompts.remove(target) {
-                agents.answer(&name, allow);
+            // A prompt answers for the one thing it asks about.
+            if let Some(prompt) = self.prompts.remove(target) {
+                match prompt {
+                    Prompt::Agent(name) => agents.answer(&name, allow),
+                    Prompt::Pause(id) => self.control.pauses.answer(id, allow),
+                }
                 let _ = self
                     .browser
                     .ask("Target.closeTarget", json!({ "targetId": target }))
@@ -352,8 +406,22 @@ impl Pages {
             return;
         };
         let update = self.control.update.borrow().as_ref().map(Update::to_json);
+        let (asking, pause) = match self.prompts.get(target) {
+            Some(Prompt::Agent(name)) => (Some(name.clone()), None),
+            Some(Prompt::Pause(id)) => (
+                None,
+                self.control
+                    .pauses
+                    .waiting()
+                    .into_iter()
+                    .find(|w| w.id == *id)
+                    .map(|w| w.to_json()),
+            ),
+            None => (None, None),
+        };
         let state = json!({
-            "asking": self.prompts.get(target),
+            "asking": asking,
+            "pause": pause,
             "update": update,
             "version": env!("CARGO_PKG_VERSION"),
             "agents": self.control.agents.snapshot().to_json(),

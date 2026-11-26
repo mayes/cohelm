@@ -4,7 +4,8 @@ use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig,
+        ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ServerCapabilities,
+        ServerConfig,
     },
     service::{RequestContext, RoleServer},
     transport::streamable_http_server::{
@@ -25,9 +26,51 @@ use crate::{
     bridge, browser,
     config::{HelperConfig, HelperError},
     pages,
+    pauses::{self, Answer, Need, Page, Pauses, Step, Verdict},
     updates::{self, Update},
 };
 use tokio::sync::watch;
+
+/// How often the Agent is told it's still waiting at a Pause.
+const STILL_WAITING: Duration = Duration::from_secs(10);
+
+/// Tell the Agent its step is waiting for the person, while it waits, when
+/// its client asked for progress.
+fn tell_waiting(context: &RequestContext<RoleServer>, step: &Step) -> AbortOnDrop {
+    let token = context.meta.get_progress_token();
+    let peer = context.peer.clone();
+    let message = format!("Waiting for the person to allow this: {}", step.describe());
+    AbortOnDrop(tokio::spawn(async move {
+        let Some(token) = token else {
+            return;
+        };
+        let mut progress = 0.0;
+        loop {
+            let _ = peer
+                .notify_progress(
+                    ProgressNotificationParam::new(token.clone(), progress)
+                        .with_message(message.clone()),
+                )
+                .await;
+            progress += 1.0;
+            tokio::time::sleep(STILL_WAITING).await;
+        }
+    }))
+}
+
+/// A task that stops when its handle is dropped, however the call that
+/// started it ends.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn refusal(text: impl Into<String>) -> CallToolResponse {
+    CallToolResult::error(vec![ContentBlock::text(text.into())]).into()
+}
 
 /// The name the Helper gives Agents, and checks for when a second Cohelm
 /// finds its port taken.
@@ -44,6 +87,10 @@ struct Helper {
     /// How long a new Agent's call waits for the person, or None when
     /// nothing in Cohelm can ask them.
     approval_wait: Option<Duration>,
+    pauses: Arc<Pauses>,
+    /// How long a Pause waits for the person, or None when nothing in
+    /// Cohelm can ask them.
+    pause_wait: Option<Duration>,
 }
 
 impl ServerHandler for Helper {
@@ -82,10 +129,112 @@ impl ServerHandler for Helper {
         if let Some(reason) = refused(&request) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(reason)]).into());
         }
+        // A risky step waits at a Pause until the person allows it.
+        let page = match self.look(&request).await {
+            Ok(page) => page,
+            Err(reason) => return Ok(refusal(reason)),
+        };
+        match pauses::classify(&request, &page) {
+            Verdict::Go => {}
+            Verdict::Refuse(reason) => return Ok(refusal(reason)),
+            Verdict::Pause(step) => {
+                let _telling = tell_waiting(&context, &step);
+                // An Agent that cancels the call, or is disconnected, takes
+                // its Pause away with it.
+                let answer = tokio::select! {
+                    answer = self.pauses.hold(&name, step.clone(), self.pause_wait) => answer,
+                    () = context.ct.cancelled() => {
+                        return Ok(refusal("The call was cancelled, so this step was blocked."));
+                    }
+                };
+                let refused = match answer {
+                    Answer::Allowed => None,
+                    Answer::Blocked => Some(format!(
+                        "The person blocked this step: {}. Don't try it again unless they ask you to.",
+                        step.describe()
+                    )),
+                    Answer::TimedOut => Some(format!(
+                        "Nobody answered the Pause in {} seconds, so this step was blocked: {}. \
+                         Ask the person before trying it again.",
+                        self.pause_wait.unwrap_or_default().as_secs(),
+                        step.describe()
+                    )),
+                    Answer::CantAsk => Some(format!(
+                        "This step was blocked because Cohelm can't ask the person here: {}.",
+                        step.describe()
+                    )),
+                    Answer::Busy => Some(format!(
+                        "This step was blocked because another step from you is already waiting \
+                         for the person: {}. Wait for that answer first.",
+                        step.describe()
+                    )),
+                };
+                if let Some(refused) = refused {
+                    return Ok(refusal(refused));
+                }
+            }
+        }
         self.backend
             .call_tool_once(request)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+}
+
+impl Helper {
+    /// Read what the Pause needs of the page a step is for. A step that
+    /// touches an element gets a fresh snapshot of that page, which Chrome
+    /// DevTools MCP then uses to find the element, so the step acts on
+    /// what the person is asked about.
+    async fn look(&self, request: &CallToolRequestParams) -> Result<Page, String> {
+        let page_id = request
+            .arguments
+            .as_ref()
+            .and_then(|args| args.get("pageId"))
+            .cloned();
+        match pauses::need(request) {
+            Need::Nothing => Ok(Page::default()),
+            Need::Site => {
+                // Only to name the site, so a failed look still pauses.
+                let pages = self
+                    .backend
+                    .call_tool(CallToolRequestParams::new("list_pages"))
+                    .await
+                    .ok()
+                    .and_then(|result| result.structured_content)
+                    .and_then(|content| content.get("pages").cloned());
+                let id = page_id.as_ref().and_then(serde_json::Value::as_i64);
+                Ok(pages.map_or_else(Page::default, |pages| Page::from_pages(&pages, id)))
+            }
+            Need::Snapshot => {
+                let cant = "Cohelm couldn't read the page to check this step, so it didn't run";
+                let mut args = serde_json::Map::new();
+                args.insert("verbose".into(), true.into());
+                if let Some(id) = page_id {
+                    args.insert("pageId".into(), id);
+                }
+                let result = self
+                    .backend
+                    .call_tool(CallToolRequestParams::new("take_snapshot").with_arguments(args))
+                    .await
+                    .map_err(|e| format!("{cant}: {e}"))?;
+                if result.is_error == Some(true) {
+                    let said: Vec<_> = result
+                        .content
+                        .iter()
+                        .filter_map(|c| c.as_text())
+                        .map(|t| t.text.as_str())
+                        .collect();
+                    return Err(format!("{cant}: {}", said.join(" ")));
+                }
+                result
+                    .structured_content
+                    .as_ref()
+                    .and_then(|content| content.get("snapshot"))
+                    .map(Page::from_snapshot)
+                    .ok_or_else(|| format!("{cant}."))
+            }
+        }
     }
 }
 
@@ -166,11 +315,13 @@ pub(crate) struct Control {
     sessions: Arc<LocalSessionManager>,
     /// A newer Cohelm, once the Helper has seen one.
     pub update: Arc<watch::Sender<Option<Update>>>,
+    pub pauses: Arc<Pauses>,
 }
 
 impl Control {
     /// End an Agent's sessions at once and forget its approval.
     pub async fn disconnect(&self, name: &str) {
+        self.pauses.block_agent(name);
         for session in self.agents.disconnect(name) {
             let _ = self.sessions.close_session(&session).await;
         }
@@ -199,6 +350,12 @@ impl RunningHelper {
     /// person does from Cohelm's Agents list.
     pub async fn disconnect(&self, name: &str) {
         self.control.disconnect(name).await;
+    }
+
+    /// The Pauses waiting for the person. The person answers in Cohelm's
+    /// prompt; tests answer here.
+    pub fn pauses(&self) -> &Pauses {
+        &self.control.pauses
     }
 
     /// A newer Cohelm, if the Helper has seen one.
@@ -429,6 +586,7 @@ pub async fn start(config: HelperConfig) -> Result<RunningHelper, HelperError> {
         agents: Agents::load(config.agents_file.clone()),
         sessions: Arc::new(LocalSessionManager::default()),
         update: Arc::new(watch::Sender::new(None)),
+        pauses: Arc::new(Pauses::default()),
     };
     if let Some(check) = config.updates.clone() {
         tokio::spawn(updates::run(
@@ -437,14 +595,13 @@ pub async fn start(config: HelperConfig) -> Result<RunningHelper, HelperError> {
             cancel.child_token(),
         ));
     }
+    let can_ask = config.browser.extension_dir.is_some();
     let helper = Helper {
         backend: backend.clone(),
         agents: control.agents.clone(),
-        approval_wait: config
-            .browser
-            .extension_dir
-            .is_some()
-            .then_some(config.approval_wait),
+        approval_wait: can_ask.then_some(config.approval_wait),
+        pauses: control.pauses.clone(),
+        pause_wait: can_ask.then_some(config.pause_wait),
     };
     let service: StreamableHttpService<Helper, LocalSessionManager> = StreamableHttpService::new(
         move || Ok(helper.clone()),
