@@ -48,12 +48,15 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     tracing::info!("Cohelm Helper is ready at {}", helper.mcp_url);
+    if browser.extension_dir.is_some() {
+        report_extension(&helper).await;
+    }
     eprintln!(
         "Cohelm Helper is ready. Connect your MCP client to {}",
         helper.mcp_url
     );
     tokio::select! {
-        signal = tokio::signal::ctrl_c() => {
+        signal = asked_to_quit() => {
             signal?;
             helper.stop().await;
             Ok(())
@@ -67,6 +70,36 @@ async fn main() -> anyhow::Result<()> {
             }
         },
     }
+}
+
+/// Ctrl-C, or on Mac and Linux a request to end such as logging out.
+async fn asked_to_quit() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => signal,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
+/// Say in the log whether the built-in extension came up, since the person
+/// would otherwise see no Pause prompts and not know why.
+async fn report_extension(helper: &cohelm_helper::RunningHelper) {
+    for _ in 0..50 {
+        if let Ok(true) = helper.extension_running().await {
+            tracing::info!("Cohelm's built-in extension is running");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    tracing::warn!("Cohelm's built-in extension didn't start");
 }
 
 /// A second start of Cohelm, such as opening a link with it, while one is

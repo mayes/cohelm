@@ -10,7 +10,7 @@ Full builds take hours and run on the project's self-hosted build machines (ADR 
 | --- | --- | --- |
 | Patches | [`patches/series`](patches/series) | Cohelm's own Chromium patches, applied after ungoogled-chromium's. Empty for now, on purpose. |
 | GN flags | [`flags.gn`](flags.gn) | Repeats the privacy flags Cohelm relies on, after the platform repo's flags. |
-| Packaging | coming in this ticket | Names the app Cohelm and starts the Helper, which starts Chromium in Cohelm's own profile folder over a private DevTools pipe (ADR 0005) and loads the built-in extension. |
+| Packaging | [`packaging/`](packaging) | Makes the Helper the app, with the browser, the built-in extension, Chrome DevTools MCP and Node inside it (ADR 0006). The Helper starts Chromium in Cohelm's own profile folder over a private DevTools pipe (ADR 0005). |
 
 The patch set stays small so each Chromium update is a quick rebase. Anything packaging can do, packaging does. A patch is added only when there's no other way, it makes one change, and its header says why it exists.
 
@@ -27,6 +27,20 @@ browser/scripts/apply-cohelm.sh build/uc-macos flags.macos.gn
 ```
 
 On Windows the platform is `windows` and the flags file is `flags.windows.gn`. `checkout-platform.sh` refuses a tag that doesn't carry the pinned ungoogled-chromium release.
+
+## Packaging
+
+After the build, make the Mac app and disk image, or the Windows installer, from the browser build and a release build of the Helper:
+
+```bash
+browser/packaging/package-macos.sh path/to/Chromium.app helper/target/release/cohelm-helper 0.1.0 dist
+```
+
+```powershell
+browser/packaging/package-windows.ps1 -Browser path\to\build -Helper helper\target\release\cohelm-helper.exe -Version 0.1.0 -Out dist
+```
+
+The Windows script needs Inno Setup 6. Both download Node and Chrome DevTools MCP at the versions pinned in [`packaging/runtime.env`](packaging/runtime.env) and stop if a checksum doesn't match. To check an installed Cohelm, point `COHELM_PACKAGED_HELPER` at its Helper and run `cargo test --release --test packaged` in `helper/`.
 
 ## Moving to a new release
 

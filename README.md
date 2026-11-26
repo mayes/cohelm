@@ -17,4 +17,4 @@ cd helper
 COHELM_BROWSER=/path/to/chromium cargo run -- https://example.com
 ```
 
-Then point your MCP client at `http://127.0.0.1:47600/mcp`. Quitting the browser stops the Helper. `COHELM_PROFILE_DIR` (default: a Cohelm folder in your app data), `COHELM_HELPER_ADDR` and `COHELM_DEVTOOLS_MCP` (a local Chrome DevTools MCP script) change the defaults.
+Then point your MCP client at `http://127.0.0.1:47600/mcp`. Quitting the browser stops the Helper. `COHELM_PROFILE_DIR` (default: a Cohelm folder in your app data), `COHELM_HELPER_ADDR`, `COHELM_EXTENSION_DIR` (the built-in extension, `../extension` in this repo) and `COHELM_DEVTOOLS_MCP` (a local Chrome DevTools MCP script) change the defaults. An installed Cohelm finds all of these inside its own app and logs to `Helper.log` beside the profile (ADR 0006).
