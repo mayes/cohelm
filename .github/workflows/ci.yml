@@ -42,7 +42,9 @@ jobs:
         run: |
           out=$(npx -y @puppeteer/browsers@2 install chrome@stable --path "$RUNNER_TEMP/cft")
           echo "$out"
-          echo "path=${out##* }" >> "$GITHUB_OUTPUT"
+          line=$(printf '%s\n' "$out" | tail -n 1)
+          # "chrome@<version> <path>"; the path has spaces in it.
+          echo "path=${line#* }" >> "$GITHUB_OUTPUT"
       - name: Mac Chrome launch check (temporary)
         if: runner.os == 'macOS'
         continue-on-error: true
