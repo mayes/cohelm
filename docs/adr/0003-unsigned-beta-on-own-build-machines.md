@@ -4,4 +4,4 @@ The first release is a 0.1 public beta for Mac and Windows, posted on GitHub Rel
 
 ## Consequences
 
-0.1 scope is kept to the core: outside MCP clients (such as the Claude and ChatGPT apps) attaching to the person's open tabs on their same sessions, **Background windows**, the **Setup wizard**, and the **Pause** on **Risky steps**. **Side panel** chat, per-site rules, outside threat-signal feeds and plugins come after 0.1.
+0.1 scope is kept to the core: outside MCP clients (such as the Claude and ChatGPT apps) attaching to the person's open tabs on their same sessions, **Background windows**, the **Setup wizard**, and the **Pause** on **Risky steps**. Local plugins are in 0.1 too. **Side panel** chat, per-site rules, outside threat-signal feeds, and plugin stores or remote plugins come after 0.1.

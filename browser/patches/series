@@ -1,0 +1,5 @@
+# Cohelm's own Chromium patches, applied after ungoogled-chromium's, in order.
+# The set starts empty on purpose: naming, the profile folder and the Helper
+# are handled when packaging, so most Chromium updates need no rebase work.
+# Add a patch only for something packaging can't do, keep it to one change,
+# and give it a header that says why it exists.

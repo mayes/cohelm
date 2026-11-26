@@ -34,3 +34,11 @@ jobs:
           COHELM_TEST_CHROME: ${{ steps.chrome.outputs.chrome-path }}
           COHELM_TEST_CHROME_ARGS: --no-sandbox
           COHELM_REQUIRE_BROWSER_TESTS: "1"
+
+  browser-scripts:
+    name: Browser build scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck browser/scripts/*.sh browser/tests/*.sh
+      - run: browser/tests/apply-cohelm.test.sh

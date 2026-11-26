@@ -41,11 +41,28 @@ async fn account(headers: HeaderMap) -> impl IntoResponse {
     })
 }
 
+/// Echoes what the site is told about the browser.
+async fn whoami(headers: HeaderMap) -> impl IntoResponse {
+    let get = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("(none)")
+            .to_owned()
+    };
+    axum::response::Html(format!(
+        "<p>user-agent: {}</p><p>sec-ch-ua: {}</p>",
+        get("user-agent"),
+        get("sec-ch-ua")
+    ))
+}
+
 /// A site where the person signs in, standing in for their real sites.
 async fn start_site() -> String {
     let app = Router::new()
         .route("/sign-in", get(sign_in))
-        .route("/account", get(account));
+        .route("/account", get(account))
+        .route("/whoami", get(whoami));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -212,6 +229,50 @@ async fn agent_works_in_the_persons_open_tab_on_their_session() {
     assert!(
         snapshot.contains("Signed in as Ada"),
         "Agent sees the page on the person's session:\n{snapshot}"
+    );
+
+    // Sites see the browser's own identity, with no Cohelm name in it.
+    call(
+        &agent,
+        "navigate_page",
+        json!({ "pageId": page_id, "type": "url", "url": format!("{site}/whoami") }),
+    )
+    .await;
+    let seen = call(&agent, "take_snapshot", json!({ "pageId": page_id })).await;
+    assert!(
+        seen.contains("Chrome/"),
+        "site sees a Chrome user agent:\n{seen}"
+    );
+    assert!(
+        !seen.to_lowercase().contains("cohelm"),
+        "site sees no Cohelm name:\n{seen}"
+    );
+    let own = call(
+        &agent,
+        "evaluate_script",
+        json!({ "pageId": page_id, "function": "() => navigator.userAgent" }),
+    )
+    .await;
+    let own_ua = own
+        .lines()
+        .find_map(|l| l.trim().strip_prefix('"')?.strip_suffix('"'))
+        .unwrap_or_else(|| panic!("page reports its user agent:\n{own}"));
+    assert!(
+        seen.contains(own_ua),
+        "site sees the browser's own user agent {own_ua}:\n{seen}"
+    );
+
+    // An Agent can't change that identity.
+    let refused = agent
+        .call_tool(CallToolRequestParams::new("emulate").with_arguments(args(
+            json!({ "pageId": page_id, "userAgent": "Cohelm/0.1" }),
+        )))
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.is_error,
+        Some(true),
+        "emulate with userAgent is refused"
     );
 
     agent.cancel().await.unwrap();

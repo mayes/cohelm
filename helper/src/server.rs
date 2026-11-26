@@ -3,8 +3,8 @@ use std::{net::SocketAddr, sync::Arc};
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResponse, ListToolsResult, PaginatedRequestParams,
-        ServerCapabilities, ServerConfig,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
+        PaginatedRequestParams, ServerCapabilities, ServerConfig,
     },
     service::{RequestContext, RoleServer},
     transport::streamable_http_server::{
@@ -48,11 +48,27 @@ impl ServerHandler for Helper {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        if let Some(reason) = refused(&request) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(reason)]).into());
+        }
         self.backend
             .call_tool_once(request)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))
     }
+}
+
+/// Steps the Helper never passes to the browser, whatever the Agent asks.
+fn refused(request: &CallToolRequestParams) -> Option<&'static str> {
+    let changes_identity = request.name == "emulate"
+        && request
+            .arguments
+            .as_ref()
+            .is_some_and(|args| args.get("userAgent").is_some_and(|v| !v.is_null()));
+    changes_identity.then_some(
+        "Cohelm keeps the browser's own user agent, so sites see plain Chrome. \
+         Run emulate without userAgent.",
+    )
 }
 
 /// A running Helper. Dropping it, or calling [`RunningHelper::stop`], shuts
