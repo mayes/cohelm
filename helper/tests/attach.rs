@@ -134,6 +134,24 @@ fn args(value: Value) -> Map<String, Value> {
     value.as_object().cloned().unwrap()
 }
 
+/// Calls a tool and fails the test if the tool reports an error.
+async fn call(
+    agent: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    tool: &'static str,
+    arguments: Value,
+) -> String {
+    let result = agent
+        .call_tool(CallToolRequestParams::new(tool).with_arguments(args(arguments)))
+        .await
+        .unwrap_or_else(|e| panic!("{tool} failed: {e}"));
+    let text = text_of(&result);
+    assert!(
+        result.is_error != Some(true),
+        "{tool} returned an error:\n{text}"
+    );
+    text
+}
+
 #[tokio::test]
 async fn agent_works_in_the_persons_open_tab_on_their_session() {
     let Some(chrome) = std::env::var_os("COHELM_TEST_CHROME").map(PathBuf::from) else {
@@ -170,12 +188,7 @@ async fn agent_works_in_the_persons_open_tab_on_their_session() {
         assert!(tools.iter().any(|t| t.name == name), "Agent can use {name}");
     }
 
-    let pages = text_of(
-        &agent
-            .call_tool(CallToolRequestParams::new("list_pages"))
-            .await
-            .unwrap(),
-    );
+    let pages = call(&agent, "list_pages", json!({})).await;
     let signed_in_tab = pages
         .lines()
         .find(|l| l.contains("/sign-in"))
@@ -186,27 +199,16 @@ async fn agent_works_in_the_persons_open_tab_on_their_session() {
         .and_then(|id| id.trim().parse().ok())
         .expect("tab has an id");
 
-    agent
-        .call_tool(
-            CallToolRequestParams::new("select_page")
-                .with_arguments(args(json!({ "pageId": page_id }))),
-        )
-        .await
-        .unwrap();
-    agent
-        .call_tool(
-            CallToolRequestParams::new("navigate_page").with_arguments(args(
-                json!({ "type": "url", "url": format!("{site}/account") }),
-            )),
-        )
-        .await
-        .unwrap();
-    let snapshot = text_of(
-        &agent
-            .call_tool(CallToolRequestParams::new("take_snapshot"))
-            .await
-            .unwrap(),
-    );
+    // chrome-devtools-mcp routes page tools by pageId, so each Agent names
+    // the tab it works in.
+    call(&agent, "select_page", json!({ "pageId": page_id })).await;
+    call(
+        &agent,
+        "navigate_page",
+        json!({ "pageId": page_id, "type": "url", "url": format!("{site}/account") }),
+    )
+    .await;
+    let snapshot = call(&agent, "take_snapshot", json!({ "pageId": page_id })).await;
     assert!(
         snapshot.contains("Signed in as Ada"),
         "Agent sees the page on the person's session:\n{snapshot}"
