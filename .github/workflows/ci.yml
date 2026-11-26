@@ -47,6 +47,15 @@ jobs:
           line=$(printf '%s\n' "$out" | tail -n 1)
           # "chrome@<version> <path>"; the path has spaces in it.
           echo "path=${line#* }" >> "$GITHUB_OUTPUT"
+      # Fetch chrome-devtools-mcp once before the tests. Tests start
+      # Helpers side by side, and several npx installs into an empty cache
+      # can read each other's half-written files.
+      - name: Fetch chrome-devtools-mcp
+        shell: bash
+        run: |
+          version=$(sed -n 's/^pub const DEVTOOLS_MCP_VERSION: &str = "\([^"]*\)".*/\1/p' src/backend.rs)
+          test -n "$version"
+          npx -y "chrome-devtools-mcp@$version" --help > /dev/null
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
