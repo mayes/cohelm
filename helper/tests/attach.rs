@@ -61,32 +61,59 @@ struct Browser {
 /// The person's browser, already open on a page where they signed in.
 async fn open_browser(chrome: PathBuf, first_page: &str) -> Browser {
     let profile = tempfile::tempdir().unwrap();
-    let child = tokio::process::Command::new(chrome)
+    let log_path = profile.path().join("chromium-stderr.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    // Extra flags for the test machine only, such as --no-sandbox on CI
+    // runners that block Chromium's sandbox. Cohelm itself never adds them.
+    let extra: Vec<String> = std::env::var("COHELM_TEST_CHROME_ARGS")
+        .map(|v| v.split_whitespace().map(str::to_owned).collect())
+        .unwrap_or_default();
+    let mut child = tokio::process::Command::new(chrome)
         .args([
             "--headless=new",
             "--no-first-run",
             "--no-default-browser-check",
             "--remote-debugging-port=0",
         ])
+        .args(&extra)
         .arg(format!("--user-data-dir={}", profile.path().display()))
         .arg(first_page)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(log)
         .kill_on_drop(true)
         .spawn()
         .expect("start Chromium");
     let port_file = profile.path().join("DevToolsActivePort");
     let mut port = None;
-    for _ in 0..100 {
+    let mut exited = None;
+    for _ in 0..300 {
         if let Ok(text) = std::fs::read_to_string(&port_file)
             && let Some(line) = text.lines().next().filter(|l| !l.is_empty())
         {
             port = Some(line.to_owned());
             break;
         }
+        if let Ok(Some(status)) = child.try_wait() {
+            exited = Some(status);
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let port = port.expect("Chromium wrote its DevTools port");
+    let Some(port) = port else {
+        let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let tail: Vec<&str> = stderr.lines().rev().take(20).collect();
+        let tail: Vec<&str> = tail.into_iter().rev().collect();
+        match exited {
+            Some(status) => panic!(
+                "Chromium exited ({status}) before writing its DevTools port:\n{}",
+                tail.join("\n")
+            ),
+            None => panic!(
+                "Chromium wrote no DevTools port within 30 s:\n{}",
+                tail.join("\n")
+            ),
+        }
+    };
     Browser {
         child,
         debug_url: format!("http://127.0.0.1:{port}"),
