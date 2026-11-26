@@ -23,6 +23,10 @@ pub enum HelperError {
     BrowserNotLocal(String),
     #[error("could not start Chrome DevTools MCP: {0}")]
     Devtools(String),
+    #[error("can't reach the browser at {0}: {1}")]
+    BrowserUnreachable(String, String),
+    #[error("lost the connection to Chrome DevTools MCP")]
+    DevtoolsClosed,
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

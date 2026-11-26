@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.105"
 axum = "0.8"
-rmcp = { version = "3.12", features = ["server", "client", "transport-child-process", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "macros"] }
+rmcp = { version = "3.12", features = ["server", "client", "transport-child-process", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "macros", "which-command"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["full"] }

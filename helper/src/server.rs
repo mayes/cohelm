@@ -11,8 +11,10 @@ use rmcp::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     },
 };
+use std::time::Duration;
+
 use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::{
     backend::{self, Backend},
@@ -53,48 +55,83 @@ impl ServerHandler for Helper {
     }
 }
 
-/// A running Helper. Drop or call [`RunningHelper::stop`] to shut it down.
+/// A running Helper. Dropping it, or calling [`RunningHelper::stop`], shuts
+/// it down and stops Chrome DevTools MCP.
 pub struct RunningHelper {
     /// Where Agents connect, for example `http://127.0.0.1:47600/mcp`.
     pub mcp_url: String,
     pub addr: SocketAddr,
     cancel: CancellationToken,
-    task: JoinHandle<()>,
+    task: JoinHandle<Result<(), HelperError>>,
+    _stop_on_drop: DropGuard,
 }
 
 impl RunningHelper {
+    /// Shut the Helper down and wait for it to finish.
     pub async fn stop(self) {
         self.cancel.cancel();
         let _ = self.task.await;
+    }
+
+    /// Wait until the Helper stops on its own, for example because Chrome
+    /// DevTools MCP exited.
+    pub async fn stopped(&mut self) -> Result<(), HelperError> {
+        match (&mut self.task).await {
+            Ok(result) => result,
+            Err(e) => Err(HelperError::Devtools(e.to_string())),
+        }
     }
 }
 
 /// Attach to the browser and start serving Agents.
 pub async fn start(config: HelperConfig) -> Result<RunningHelper, HelperError> {
     config.validate()?;
+    // Take the port first, so a busy port fails before anything starts.
+    let listener = tokio::net::TcpListener::bind(config.listen).await?;
+    let addr = listener.local_addr()?;
     let backend = Arc::new(backend::connect(&config.devtools, &config.browser_url).await?);
 
     let cancel = CancellationToken::new();
-    let helper = Helper { backend };
+    let helper = Helper {
+        backend: backend.clone(),
+    };
     let service: StreamableHttpService<Helper, LocalSessionManager> = StreamableHttpService::new(
         move || Ok(helper.clone()),
         Default::default(),
-        StreamableHttpServerConfig::default().with_cancellation_token(cancel.child_token()),
+        StreamableHttpServerConfig::default()
+            // Host is checked against loopback by default; also refuse any
+            // request a web page sends, since Agents don't send an Origin.
+            .enforce_origin_validation()
+            .with_cancellation_token(cancel.child_token()),
     );
     let router = axum::Router::new().nest_service("/mcp", service);
-    let listener = tokio::net::TcpListener::bind(config.listen).await?;
-    let addr = listener.local_addr()?;
     let task = tokio::spawn({
         let cancel = cancel.clone();
         async move {
-            let _ = axum::serve(listener, router)
-                .with_graceful_shutdown(async move { cancel.cancelled_owned().await })
-                .await;
+            let server = axum::serve(listener, router)
+                .with_graceful_shutdown(cancel.clone().cancelled_owned());
+            let watch = async {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    if backend.peer().is_transport_closed() {
+                        return;
+                    }
+                }
+            };
+            tokio::select! {
+                served = server => served.map_err(HelperError::from),
+                () = watch => {
+                    tracing::error!("Chrome DevTools MCP exited; stopping the Helper");
+                    cancel.cancel();
+                    Err(HelperError::DevtoolsClosed)
+                }
+            }
         }
     });
     Ok(RunningHelper {
         mcp_url: format!("http://{addr}/mcp"),
         addr,
+        _stop_on_drop: cancel.clone().drop_guard(),
         cancel,
         task,
     })

@@ -28,10 +28,9 @@ jobs:
         with:
           chrome-version: stable
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
         env:
           COHELM_TEST_CHROME: ${{ steps.chrome.outputs.chrome-path }}
           COHELM_TEST_CHROME_ARGS: --no-sandbox
           COHELM_REQUIRE_BROWSER_TESTS: "1"
-          CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS: "1"

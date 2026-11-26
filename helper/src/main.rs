@@ -18,12 +18,17 @@ async fn main() -> anyhow::Result<()> {
         config.devtools = DevtoolsCommand::node_script(script);
     }
 
-    let helper = start(config).await?;
+    let mut helper = start(config).await?;
     eprintln!(
         "Cohelm Helper is ready. Connect your MCP client to {}",
         helper.mcp_url
     );
-    tokio::signal::ctrl_c().await?;
-    helper.stop().await;
-    Ok(())
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            helper.stop().await;
+            Ok(())
+        }
+        stopped = helper.stopped() => Ok(stopped?),
+    }
 }
