@@ -208,6 +208,11 @@ impl Agents {
         }
     }
 
+    /// Whether `name` is allowed right now, without asking the person.
+    pub(crate) fn is_allowed(&self, name: &str) -> bool {
+        name_of(name).is_ok_and(|name| self.lock().allowed.contains(&name))
+    }
+
     /// The person's answer for `name`. Allowing is remembered across
     /// restarts; declining lasts until Cohelm restarts.
     pub fn answer(&self, name: &str, allow: bool) {

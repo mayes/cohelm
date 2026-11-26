@@ -221,8 +221,15 @@ async fn a_risky_step_waits_until_the_person_allows_or_blocks_it() {
     assert!(snapshot(&peer).await.contains("Message sent"));
 
     // Blocked: the Agent is told, and the page never sees it.
-    let reload = call(&peer, "navigate_page", json!({ "type": "reload" })).await;
-    assert_ne!(reload.is_error, Some(true), "{}", text_of(&reload));
+    // A fresh copy of the page, opened by its address: a reload would
+    // send the form again, so it waits too.
+    let fresh = call(
+        &peer,
+        "navigate_page",
+        json!({ "type": "url", "url": format!("{site}/compose") }),
+    )
+    .await;
+    assert_ne!(fresh.is_error, Some(true), "{}", text_of(&fresh));
     let page = snapshot(&peer).await;
     let held = tokio::spawn({
         let peer = peer.clone();
@@ -381,10 +388,15 @@ async fn enter_and_scripts_wait_however_they_are_sent() {
     )
     .await;
     assert_eq!(step.action, "type into “Note” and press Enter");
-    assert_eq!(step.detail.as_deref(), Some("hi"));
+    assert_eq!(step.detail.as_deref(), Some("hi\n"));
     let step = blocked(&helper, &peer, "type_text", json!({ "text": "hello\n" })).await;
-    assert_eq!(step.detail.as_deref(), Some("hello"));
+    assert_eq!(step.detail.as_deref(), Some("hello\n"));
     blocked(&helper, &peer, "press_key", json!({ "key": "NumpadEnter" })).await;
+    // With nothing focused, keys can be the page's shortcuts.
+    let step = blocked(&helper, &peer, "press_key", json!({ "key": "Delete" })).await;
+    assert_eq!(step.kind, Kind::Delete);
+    let step = blocked(&helper, &peer, "navigate_page", json!({ "type": "reload" })).await;
+    assert_eq!(step.action, "reload the page");
     let send = "document.getElementById('status').textContent = 'Message sent'";
     let step = blocked(
         &helper,

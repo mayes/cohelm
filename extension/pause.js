@@ -13,9 +13,23 @@ const KINDS = {
 };
 
 // As with the Agent prompt, nothing has focus and the buttons wait a
-// moment, so a key meant for another window can't answer it.
+// moment, so a key or click meant for another window can't answer it.
+// They wait again whenever the window comes forward or shows a new step,
+// since prompts from two Agents can sit one over the other.
 const SETTLE_MS = 1000;
-let shown = false;
+let shownId = null;
+let settling = null;
+const settle = () => {
+  for (const id of ["allow", "block"]) $(id).disabled = true;
+  clearTimeout(settling);
+  settling = setTimeout(() => {
+    for (const id of ["allow", "block"]) $(id).disabled = false;
+  }, SETTLE_MS);
+};
+window.addEventListener("focus", settle);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) settle();
+});
 
 const send = connect((state) => {
   const pause = state.pause;
@@ -31,12 +45,9 @@ const send = connect((state) => {
     $("detail").textContent = pause.detail ?? "";
     $("may").textContent = may;
     show("prompt");
-    if (!shown) {
-      shown = true;
-      for (const id of ["allow", "block"]) $(id).disabled = true;
-      setTimeout(() => {
-        for (const id of ["allow", "block"]) $(id).disabled = false;
-      }, SETTLE_MS);
+    if (shownId !== pause.id) {
+      shownId = pause.id;
+      settle();
     }
   } else {
     show("done");

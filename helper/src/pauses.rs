@@ -79,8 +79,12 @@ impl Step {
         }
     }
 
+    /// Show the person what the Agent sends with the step, all of it, as
+    /// the Agent sent it. [`classify`] turns away one too long to read.
     fn with_detail(mut self, detail: &str) -> Self {
-        self.detail = Some(shortened(detail, 200));
+        if !detail.is_empty() {
+            self.detail = Some(detail.to_owned());
+        }
         self
     }
 
@@ -95,8 +99,9 @@ impl Step {
 
 /// Words on a control that mark what pressing it does, checked in order,
 /// so "Delete and send" counts as a delete. A word ending in `*` matches
-/// any word it starts ("payment" for `payment*`), and `…` stands for up to
-/// two other words ("Place your order" for `place … order*`).
+/// any word it starts ("payment" for `payment*`), `…` stands for up to
+/// two other words ("Place your order" for `place … order*`), and `^`
+/// matches only the whole label ("Order", but not "Order history").
 const WORDS: &[(Kind, &[&str])] = &[
     (
         Kind::Delete,
@@ -138,13 +143,18 @@ const WORDS: &[(Kind, &[&str])] = &[
             "sell",
             "bid",
             "add … funds",
+            "^order",
+            "rent",
+            "tip",
+            "claim",
+            "redeem*",
         ],
     ),
     (
         Kind::Send,
         &[
             "send", "reply", "forward", "post", "publish*", "share", "invite*", "tweet", "comment",
-            "upload*",
+            "upload*", "repost*", "retweet*", "reshare*", "^like", "follow",
         ],
     ),
     (
@@ -165,6 +175,12 @@ const WORDS: &[(Kind, &[&str])] = &[
             "authoris*",
             "allow",
             "grant",
+            "save",
+            "join",
+            "enrol*",
+            "^yes",
+            "^ok",
+            "^okay",
         ],
     ),
 ];
@@ -233,6 +249,36 @@ const PRESSABLE: &[&str] = &[
 /// Roles that `fill` ticks or turns on rather than types into.
 const TICKABLE: &[&str] = &["checkbox", "radio", "switch", "menuitemcheckbox"];
 
+/// Roles that take typing. Outside them, a key can be one of the page's
+/// shortcuts, such as `#` for delete in some mail apps.
+const EDITABLE: &[&str] = &["textbox", "searchbox", "combobox", "spinbutton"];
+
+/// Keys that only move around the page or hold a modifier.
+const MOVING: &[&str] = &[
+    "tab",
+    "escape",
+    "arrowup",
+    "arrowdown",
+    "arrowleft",
+    "arrowright",
+    "home",
+    "end",
+    "pageup",
+    "pagedown",
+    "shift",
+    "control",
+    "alt",
+    "meta",
+    "capslock",
+];
+
+/// Keys that delete what's selected.
+const DELETING: &[&str] = &["delete", "backspace"];
+
+/// The most the Pause shows of what a step carries. A longer one is turned
+/// away rather than shown cut short.
+pub const MOST_DETAIL: usize = 4000;
+
 /// What the Helper must look at before it can check a step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Need {
@@ -250,12 +296,17 @@ pub struct Page {
     pub url: Option<String>,
     elements: HashMap<String, Element>,
     focused: Option<String>,
+    /// What the page's open dialog says, if it has one.
+    dialog: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct Element {
     role: String,
     name: String,
+    readonly: bool,
+    parent: Option<String>,
+    children: Vec<String>,
 }
 
 impl Page {
@@ -267,46 +318,129 @@ impl Page {
             url: root.get("url").and_then(Value::as_str).map(str::to_owned),
             ..Page::default()
         };
-        let mut nodes = vec![root];
-        while let Some(node) = nodes.pop() {
-            if let Some(id) = node.get("id").and_then(Value::as_str) {
+        let mut nodes: Vec<(&Value, Option<String>)> = vec![(root, None)];
+        while let Some((node, parent)) = nodes.pop() {
+            let id = node.get("id").and_then(Value::as_str).map(str::to_owned);
+            if let Some(id) = &id {
                 let text = |key| node.get(key).and_then(Value::as_str).unwrap_or_default();
+                if let Some(parent) = parent.as_ref().and_then(|p| page.elements.get_mut(p)) {
+                    parent.children.push(id.clone());
+                }
                 page.elements.insert(
-                    id.to_owned(),
+                    id.clone(),
                     Element {
                         role: text("role").to_owned(),
                         name: text("name").to_owned(),
+                        readonly: node.get("readonly") == Some(&Value::Bool(true)),
+                        parent: parent.clone(),
+                        children: Vec::new(),
                     },
                 );
                 if node.get("focused") == Some(&Value::Bool(true)) {
-                    page.focused = Some(id.to_owned());
+                    page.focused = Some(id.clone());
                 }
             }
             if let Some(children) = node.get("children").and_then(Value::as_array) {
-                nodes.extend(children);
+                let parent = id.or(parent);
+                nodes.extend(children.iter().map(|child| (child, parent.clone())));
             }
         }
         page
     }
 
-    /// Read the address of page `id`, or of the selected page, from the
-    /// structured pages list.
-    pub fn from_pages(pages: &Value, id: Option<i64>) -> Self {
-        let url = pages.as_array().and_then(|pages| {
-            pages
-                .iter()
-                .find(|p| match id {
-                    Some(id) => p.get("id").and_then(Value::as_i64) == Some(id),
-                    None => p.get("selected") == Some(&Value::Bool(true)),
-                })
+    /// Read the address of page `id`, or of the selected page, from what
+    /// `list_pages` gives as structured content, with the selected page's
+    /// open dialog.
+    pub fn from_pages(content: &Value, id: Option<i64>) -> Self {
+        let pages = content.get("pages").and_then(Value::as_array);
+        let selected = |p: &&Value| p.get("selected") == Some(&Value::Bool(true));
+        let page = pages.and_then(|pages| {
+            pages.iter().find(|p| match id {
+                Some(id) => p.get("id").and_then(Value::as_i64) == Some(id),
+                None => selected(p),
+            })
+        });
+        let dialog = page
+            .filter(selected)
+            .and_then(|_| content.get("dialog"))
+            .and_then(|d| d.get("message"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        Page {
+            url: page
                 .and_then(|p| p.get("url"))
                 .and_then(Value::as_str)
-                .map(str::to_owned)
-        });
-        Page {
-            url,
+                .map(str::to_owned),
+            dialog,
             ..Page::default()
         }
+    }
+
+    /// What pressing element `uid` presses: the nearest control that holds
+    /// it, or, outside any control, the element read with the words in and
+    /// around it. A click on an unnamed part of a button presses the button.
+    fn target(&self, uid: &str) -> Option<Element> {
+        let element = self.elements.get(uid)?;
+        let mut at = Some(uid);
+        while let Some(id) = at {
+            let Some(node) = self.elements.get(id) else {
+                break;
+            };
+            if PRESSABLE.contains(&node.role.as_str()) {
+                return Some(node.clone());
+            }
+            at = node.parent.as_deref();
+        }
+        let mut at = Some(uid);
+        for _ in 0..4 {
+            // The page as a whole isn't one control.
+            let Some(id) = at.filter(|id| {
+                self.elements
+                    .get(*id)
+                    .is_some_and(|n| n.role != "RootWebArea")
+            }) else {
+                break;
+            };
+            let words = self.words_in(id);
+            if !words.is_empty() {
+                return Some(Element {
+                    name: words,
+                    ..element.clone()
+                });
+            }
+            at = self.elements.get(id).and_then(|n| n.parent.as_deref());
+        }
+        Some(element.clone())
+    }
+
+    /// The names in and under element `uid`, as far as a label goes.
+    fn words_in(&self, uid: &str) -> String {
+        let mut words = String::new();
+        let mut nodes = vec![uid];
+        while let Some(id) = nodes.pop() {
+            if words.len() > 300 {
+                break;
+            }
+            let Some(node) = self.elements.get(id) else {
+                continue;
+            };
+            if !node.name.is_empty() && !words.contains(&node.name) {
+                if !words.is_empty() {
+                    words.push(' ');
+                }
+                words.push_str(&node.name);
+            }
+            nodes.extend(node.children.iter().rev().map(String::as_str));
+        }
+        words
+    }
+
+    /// Whether what has focus takes typing.
+    fn typing_goes_in(&self) -> bool {
+        self.focused
+            .as_ref()
+            .and_then(|id| self.elements.get(id))
+            .is_some_and(|e| EDITABLE.contains(&e.role.as_str()) && !e.readonly)
     }
 
     fn site(&self) -> Option<String> {
@@ -338,6 +472,10 @@ fn kind_of(label: &str) -> Option<Kind> {
 
 /// Whether `words` hold `mark`, read as [`WORDS`] describes.
 fn has(words: &[&str], mark: &str) -> bool {
+    if let Some(whole) = mark.strip_prefix('^') {
+        let whole: Vec<&str> = whole.split(' ').collect();
+        return words == whole.as_slice();
+    }
     let mark: Vec<&str> = mark.split(' ').collect();
     (0..words.len()).any(|start| matches_at(&words[start..], &mark))
 }
@@ -393,6 +531,14 @@ fn presses(key: &str, keys: &[&str]) -> bool {
         .any(|part| keys.contains(part) || keys.contains(&part.to_lowercase().as_str()))
 }
 
+/// Whether every key in `key`, such as `Shift+Tab`, only moves or holds.
+fn only_moves(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .split('+')
+            .all(|part| MOVING.contains(&part.to_lowercase().as_str()))
+}
+
 fn has_newline(text: &str) -> bool {
     text.contains(['\n', '\r'])
 }
@@ -425,28 +571,35 @@ pub fn need(request: &CallToolRequestParams) -> Need {
     let text = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default();
     match request.name.as_ref() {
         "click" | "fill" | "fill_form" | "drag" => Need::Snapshot,
+        "upload_file" => Need::Snapshot,
         "type_text" => {
-            let key = text("submitKey");
-            if has_newline(text("text")) || presses(key, ENTER) {
+            if has_newline(text("text")) || presses(text("submitKey"), ENTER) {
                 Need::Site
-            } else if text("text").contains(' ') || presses(key, SPACE) {
-                Need::Snapshot
             } else {
-                Need::Nothing
+                Need::Snapshot
             }
         }
         "press_key" => {
             if presses(text("key"), ENTER) {
                 Need::Site
-            } else if presses(text("key"), SPACE) {
-                Need::Snapshot
-            } else {
+            } else if only_moves(text("key")) {
                 Need::Nothing
+            } else {
+                Need::Snapshot
             }
+        }
+        "evaluate_script"
+            if args
+                .get("args")
+                .and_then(Value::as_array)
+                .is_some_and(|a| !a.is_empty()) =>
+        {
+            Need::Snapshot
         }
         "handle_dialog" if text("action") != "accept" => Need::Nothing,
         "navigate_page" | "new_page"
             if !script_address(text("url"))
+                && text("type") != "reload"
                 && args.get("initScript").is_none_or(Value::is_null) =>
         {
             Need::Nothing
@@ -470,8 +623,27 @@ pub enum Verdict {
 /// Whether this step waits for the person, read against `page`, which the
 /// Helper fetched as [`need`] asked.
 pub fn classify(request: &CallToolRequestParams, page: &Page) -> Verdict {
+    // The Helper looks up the page by a whole-number id, as Chrome DevTools
+    // MCP does, so the person is never asked about one tab while the step
+    // runs on another.
+    if let Some(id) = args(request).get("pageId")
+        && !id.is_null()
+        && id.as_i64().is_none()
+    {
+        return Verdict::Refuse("pageId must be a whole number, as list_pages gives it.".into());
+    }
     let mut verdict = check(request, page);
     if let Verdict::Pause(step) = &mut verdict {
+        if step
+            .detail
+            .as_ref()
+            .is_some_and(|d| d.chars().count() > MOST_DETAIL)
+        {
+            return Verdict::Refuse(format!(
+                "This step carries more than {MOST_DETAIL} characters, too much for the person \
+                 to read before allowing it. Send it in smaller parts."
+            ));
+        }
         step.site = page.site();
     }
     verdict
@@ -487,17 +659,20 @@ fn check(request: &CallToolRequestParams, page: &Page) -> Verdict {
     let tool = request.name.as_ref();
     let args = args(request);
     let text = |key: &str| args.get(key).and_then(Value::as_str);
+    let uid_in = |key: &str| -> Result<&str, Verdict> {
+        text(key).ok_or_else(|| Verdict::Refuse(format!("{tool} needs an element's uid in {key}.")))
+    };
     let element = |key: &str| -> Result<&Element, Verdict> {
-        let Some(uid) = text(key) else {
-            return Err(Verdict::Refuse(format!(
-                "{tool} needs an element's uid in {key}."
-            )));
-        };
+        let uid = uid_in(key)?;
         page.elements.get(uid).ok_or_else(|| gone(uid))
     };
+    let target = |key: &str| -> Result<Element, Verdict> {
+        let uid = uid_in(key)?;
+        page.target(uid).ok_or_else(|| gone(uid))
+    };
     match tool {
-        "click" => match element("uid") {
-            Ok(element) => pressing(element, "click"),
+        "click" => match target("uid") {
+            Ok(element) => pressing(&element, "click"),
             Err(refusal) => refusal,
         },
         "fill" => match element("uid") {
@@ -526,11 +701,11 @@ fn check(request: &CallToolRequestParams, page: &Page) -> Verdict {
             }
             Verdict::Go
         }
-        "drag" => match (element("from_uid"), element("to_uid")) {
+        "drag" => match (target("from_uid"), target("to_uid")) {
             (Ok(from), Ok(to)) => match kind_of(&from.name).or_else(|| kind_of(&to.name)) {
                 Some(kind) => Verdict::Pause(Step::new(
                     kind,
-                    format!("drag {} onto {}", label(from), label(to)),
+                    format!("drag {} onto {}", label(&from), label(&to)),
                 )),
                 None => Verdict::Go,
             },
@@ -541,48 +716,99 @@ fn check(request: &CallToolRequestParams, page: &Page) -> Verdict {
             let key = text("submitKey").unwrap_or_default();
             if has_newline(typed) || presses(key, ENTER) {
                 Verdict::Pause(Step::new(Kind::Submit, "type and press Enter").with_detail(typed))
-            } else if typed.contains(' ') || presses(key, SPACE) {
-                focused(page, "type a space on")
-            } else {
+            } else if page.typing_goes_in() || (typed.is_empty() && key.is_empty()) {
                 Verdict::Go
+            } else if let pause @ Verdict::Pause(_) = focused(page, "type a space on")
+                && (typed.contains(' ') || presses(key, SPACE))
+            {
+                pause
+            } else {
+                Verdict::Pause(
+                    Step::new(Kind::Submit, "type on the page outside a text box")
+                        .with_detail(typed),
+                )
             }
         }
         "press_key" => {
             let key = text("key").unwrap_or_default();
             if presses(key, ENTER) {
                 Verdict::Pause(Step::new(Kind::Submit, "press Enter"))
+            } else if only_moves(key) || page.typing_goes_in() {
+                Verdict::Go
             } else if presses(key, SPACE) {
                 focused(page, "press Space on")
+            } else if presses(key, DELETING) {
+                Verdict::Pause(Step::new(
+                    Kind::Delete,
+                    format!("press {key} outside a text box"),
+                ))
             } else {
-                Verdict::Go
+                Verdict::Pause(Step::new(
+                    Kind::Submit,
+                    format!("press {key} outside a text box"),
+                ))
             }
         }
         "upload_file" => {
-            let count = args
+            let into = match target("uid") {
+                Ok(element) => element,
+                Err(refusal) => return refusal,
+            };
+            let paths: Vec<&str> = args
                 .get("filePaths")
                 .and_then(Value::as_array)
-                .map_or(1, Vec::len);
-            let files = if count == 1 {
+                .map(|paths| paths.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let files = if paths.len() == 1 {
                 "a file".to_owned()
             } else {
-                format!("{count} files")
+                format!("{} files", paths.len())
             };
-            Verdict::Pause(Step::new(Kind::Send, format!("upload {files}")))
+            Verdict::Pause(
+                Step::new(Kind::Send, format!("upload {files} into {}", label(&into)))
+                    .with_detail(&paths.join("\n")),
+            )
         }
         "handle_dialog" => match text("action") {
             Some("accept") => {
-                let step = Step::new(Kind::Submit, "accept the page's dialog");
-                Verdict::Pause(match text("promptText") {
-                    Some(typed) => step.with_detail(typed),
-                    None => step,
-                })
+                let mut detail = Vec::new();
+                if let Some(message) = &page.dialog {
+                    detail.push(format!("The page asks: {message}"));
+                }
+                if let Some(typed) = text("promptText") {
+                    detail.push(format!("The answer: {typed}"));
+                }
+                Verdict::Pause(
+                    Step::new(Kind::Submit, "accept the page's dialog")
+                        .with_detail(&detail.join("\n\n")),
+                )
             }
             _ => Verdict::Go,
         },
-        "evaluate_script" => Verdict::Pause(
-            Step::new(Kind::Submit, "run a script on the page")
-                .with_detail(text("function").unwrap_or_default()),
-        ),
+        "evaluate_script" => {
+            if args.get("sourcePath").is_some_and(|v| !v.is_null()) {
+                return Verdict::Refuse(
+                    "Send the script itself in function, so the person can read it before it runs."
+                        .into(),
+                );
+            }
+            let mut detail = text("function").unwrap_or_default().to_owned();
+            let uids = args.get("args").and_then(Value::as_array);
+            let mut given = Vec::new();
+            for uid in uids.into_iter().flatten() {
+                let Some(uid) = uid.as_str() else {
+                    return Verdict::Refuse("evaluate_script's args must be element uids.".into());
+                };
+                match page.elements.get(uid) {
+                    Some(element) => given.push(label(element)),
+                    None => return gone(uid),
+                }
+            }
+            if !given.is_empty() {
+                detail.push_str(&format!("\n\nGiven: {}", given.join(", ")));
+            }
+            Verdict::Pause(Step::new(Kind::Submit, "run a script on the page").with_detail(&detail))
+        }
         "click_at" => Verdict::Pause(Step::new(
             Kind::Submit,
             "click a spot on the page Cohelm can't name",
@@ -602,6 +828,9 @@ fn check(request: &CallToolRequestParams, page: &Page) -> Verdict {
                 Verdict::Pause(
                     Step::new(Kind::Submit, "open an address that runs a script").with_detail(url),
                 )
+            } else if text("type") == Some("reload") {
+                // Reloading sends a form again without asking.
+                Verdict::Pause(Step::new(Kind::Submit, "reload the page"))
             } else {
                 Verdict::Go
             }
@@ -651,17 +880,24 @@ fn filling(element: &Element, value: &str) -> Verdict {
             .with_detail(value),
         );
     }
-    if TICKABLE.contains(&element.role.as_str()) {
-        return pressing(element, "tick");
+    // Chrome DevTools MCP ticks by what the element is in the page, which
+    // its role may not show, so a box's words count whenever the value
+    // ticks.
+    let ticks = matches!(value.to_lowercase().as_str(), "true" | "false");
+    if TICKABLE.contains(&element.role.as_str()) || ticks {
+        return match kind_of(&element.name) {
+            Some(kind) => Verdict::Pause(Step::new(kind, format!("tick {}", label(element)))),
+            None => Verdict::Go,
+        };
     }
     Verdict::Go
 }
 
 /// A key that presses whatever has focus.
 fn focused(page: &Page, verb: &str) -> Verdict {
-    let element = page.focused.as_ref().and_then(|id| page.elements.get(id));
+    let element = page.focused.as_deref().and_then(|id| page.target(id));
     match element {
-        Some(element) if PRESSABLE.contains(&element.role.as_str()) => pressing(element, verb),
+        Some(element) if PRESSABLE.contains(&element.role.as_str()) => pressing(&element, verb),
         _ => Verdict::Go,
     }
 }
@@ -842,6 +1078,16 @@ mod tests {
                     { "id": "3_12", "role": "listitem", "name": "A note from Sam" },
                     { "id": "3_13", "role": "link", "name": "Trash" },
                 ]},
+                { "id": "3_14", "role": "button", "name": "Place order", "children": [
+                    { "id": "3_15", "role": "none" },
+                    { "id": "3_16", "role": "image", "name": "" },
+                ]},
+                { "id": "3_17", "role": "generic", "children": [
+                    { "id": "3_18", "role": "StaticText", "name": "Delete draft" },
+                    { "id": "3_19", "role": "image" },
+                ]},
+                { "id": "3_20", "role": "button", "name": "I agree" },
+                { "id": "3_21", "role": "generic" },
             ],
         }))
     }
@@ -887,10 +1133,7 @@ mod tests {
                 "navigate_page",
                 json!({ "url": "https://example.com/delete" }),
             ),
-            (
-                "navigate_page",
-                json!({ "type": "reload", "initScript": null }),
-            ),
+            ("navigate_page", json!({ "type": "back" })),
             ("new_page", json!({ "url": "https://example.com/" })),
             ("take_snapshot", json!({})),
             ("hover", json!({ "uid": "3_1" })),
@@ -963,7 +1206,11 @@ mod tests {
             assert_eq!(step(tool, args).kind, Kind::Submit);
         }
         let typed = step("type_text", json!({ "text": "Hello Sam\n" }));
-        assert_eq!(typed.detail.as_deref(), Some("Hello Sam"));
+        assert_eq!(
+            typed.detail.as_deref(),
+            Some("Hello Sam\n"),
+            "all of it, as sent"
+        );
     }
 
     #[test]
@@ -1016,7 +1263,7 @@ mod tests {
             "evaluate_script",
             json!({ "function": "() => {\n  send()\n}" }),
         );
-        assert_eq!(script.detail.as_deref(), Some("() => { send() }"));
+        assert_eq!(script.detail.as_deref(), Some("() => {\n  send()\n}"));
     }
 
     #[test]
@@ -1046,8 +1293,8 @@ mod tests {
     fn need_matches_classify() {
         // Whatever needs nothing goes ahead on an empty page.
         for (tool, args) in [
-            ("type_text", json!({ "text": "word" })),
             ("press_key", json!({ "key": "Tab" })),
+            ("press_key", json!({ "key": "Shift+ArrowDown" })),
             ("navigate_page", json!({ "url": "https://a.example/" })),
             ("handle_dialog", json!({ "action": "dismiss" })),
             ("take_snapshot", json!({})),
@@ -1068,7 +1315,20 @@ mod tests {
             need(&call("press_key", json!({ "key": "Enter" }))),
             Need::Site
         );
+        assert_eq!(
+            need(&call("type_text", json!({ "text": "word" }))),
+            Need::Snapshot,
+            "to see where the typing goes"
+        );
         assert_eq!(need(&call("evaluate_script", json!({}))), Need::Site);
+        assert_eq!(
+            need(&call("evaluate_script", json!({ "args": ["1_1"] }))),
+            Need::Snapshot
+        );
+        assert_eq!(
+            need(&call("navigate_page", json!({ "type": "reload" }))),
+            Need::Site
+        );
         assert_eq!(need(&call("mock_network", json!({}))), Need::Site);
     }
 
@@ -1099,6 +1359,15 @@ mod tests {
             ("Payload viewer", None),
             ("Sender details", None),
             ("Your orders", None),
+            ("Order", Some(Kind::Pay)),
+            ("Order history", None),
+            ("Save changes", Some(Kind::Submit)),
+            ("Yes", Some(Kind::Submit)),
+            ("Join meeting", Some(Kind::Submit)),
+            ("Repost", Some(Kind::Send)),
+            ("Like", Some(Kind::Send)),
+            ("Looks like rain", None),
+            ("Tips", None),
             ("Menu", None),
         ] {
             assert_eq!(kind_of(label), kind, "{label}");
@@ -1119,10 +1388,10 @@ mod tests {
         }));
         assert_eq!(page.site().as_deref(), Some("news.example"));
 
-        let pages = json!([
+        let pages = json!({ "pages": [
             { "id": 1, "url": "https://news.example/", "title": "https://bank.example/", "selected": true },
             { "id": 2, "url": "https://user@bank.example:8443/x", "title": "Bank", "selected": false },
-        ]);
+        ], "dialog": { "type": "confirm", "message": "Leave this page?" } });
         assert_eq!(
             Page::from_pages(&pages, None).site().as_deref(),
             Some("news.example")
@@ -1132,6 +1401,107 @@ mod tests {
             Some("bank.example:8443")
         );
         assert_eq!(Page::from_pages(&pages, Some(7)).site(), None);
+        // The dialog is the selected page's, so it's read only for that page.
+        assert_eq!(
+            Page::from_pages(&pages, Some(1)).dialog.as_deref(),
+            Some("Leave this page?")
+        );
+        assert_eq!(Page::from_pages(&pages, Some(2)).dialog, None);
+    }
+
+    #[test]
+    fn a_step_shows_what_it_presses_and_carries() {
+        // An unnamed part of a button presses the button.
+        for uid in ["3_15", "3_16"] {
+            let order = step("click", json!({ "uid": uid }));
+            assert_eq!(
+                (order.kind, order.action.as_str()),
+                (Kind::Pay, "click “Place order”")
+            );
+        }
+        // Outside a control, the words around the click count.
+        assert_eq!(step("click", json!({ "uid": "3_19" })).kind, Kind::Delete);
+        assert_eq!(step("click", json!({ "uid": "3_17" })).kind, Kind::Delete);
+        assert_eq!(click("3_21"), Verdict::Go, "not the whole page's words");
+
+        // A whole-number pageId only, so the prompt names the right tab.
+        assert!(matches!(
+            verdict("press_key", json!({ "key": "Enter", "pageId": 2.0 })),
+            Verdict::Refuse(_)
+        ));
+        assert!(matches!(
+            verdict("press_key", json!({ "key": "Enter", "pageId": 2 })),
+            Verdict::Pause(_)
+        ));
+
+        // Reloading can send a form again.
+        assert_eq!(
+            step("navigate_page", json!({ "type": "reload" })).action,
+            "reload the page"
+        );
+
+        // What a step carries is shown whole, or the step is turned away.
+        let script = format!("{}form.submit()", " ".repeat(300));
+        let shown = step("evaluate_script", json!({ "function": script }));
+        assert!(shown.detail.unwrap().ends_with("form.submit()"));
+        let long = "x".repeat(MOST_DETAIL + 1);
+        assert!(matches!(
+            verdict("evaluate_script", json!({ "function": long })),
+            Verdict::Refuse(_)
+        ));
+        assert!(matches!(
+            verdict("evaluate_script", json!({ "sourcePath": "/tmp/a.js" })),
+            Verdict::Refuse(_)
+        ));
+        let given = step(
+            "evaluate_script",
+            json!({ "function": "(el) => el.click()", "args": ["3_1"] }),
+        );
+        assert!(given.detail.unwrap().ends_with("Given: “Place your order”"));
+        let upload = step(
+            "upload_file",
+            json!({ "uid": "3_5", "filePaths": ["/home/me/a.pdf", "/home/me/b.pdf"] }),
+        );
+        assert_eq!(upload.action, "upload 2 files into “Send to \"Sam\"”");
+        assert_eq!(
+            upload.detail.as_deref(),
+            Some("/home/me/a.pdf\n/home/me/b.pdf")
+        );
+        let page = Page::from_pages(
+            &json!({ "pages": [{ "id": 1, "url": "https://a.example/", "selected": true }],
+                     "dialog": { "message": "Delete 40 files?" } }),
+            None,
+        );
+        let accept = classify(&call("handle_dialog", json!({ "action": "accept" })), &page);
+        assert!(
+            matches!(&accept, Verdict::Pause(s) if s.detail.as_deref() == Some("The page asks: Delete 40 files?"))
+        );
+
+        // A box Chrome DevTools MCP ticks whatever its role says.
+        assert_eq!(
+            step("fill", json!({ "uid": "3_20", "value": "true" })).action,
+            "tick “I agree”"
+        );
+
+        // Keys outside a text box can be the page's shortcuts.
+        let keys = |tool, args| classify(&call(tool, args), &with_focus("3_2"));
+        assert!(matches!(
+            keys("press_key", json!({ "key": "Delete" })),
+            Verdict::Pause(Step {
+                kind: Kind::Delete,
+                ..
+            })
+        ));
+        assert!(matches!(
+            keys("type_text", json!({ "text": "#" })),
+            Verdict::Pause(_)
+        ));
+        assert_eq!(keys("press_key", json!({ "key": "Tab" })), Verdict::Go);
+        assert_eq!(
+            verdict("type_text", json!({ "text": "#" })),
+            Verdict::Go,
+            "inside a text box it's typing"
+        );
     }
 
     #[tokio::test]

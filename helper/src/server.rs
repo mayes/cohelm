@@ -172,6 +172,12 @@ impl ServerHandler for Helper {
                 if let Some(refused) = refused {
                     return Ok(refusal(refused));
                 }
+                // Disconnected while the step waited: it doesn't run.
+                if !self.agents.is_allowed(&name) {
+                    return Ok(refusal(
+                        "The person disconnected you, so this step was blocked.".to_owned(),
+                    ));
+                }
             }
         }
         self.backend
@@ -201,8 +207,7 @@ impl Helper {
                     .call_tool(CallToolRequestParams::new("list_pages"))
                     .await
                     .ok()
-                    .and_then(|result| result.structured_content)
-                    .and_then(|content| content.get("pages").cloned());
+                    .and_then(|result| result.structured_content);
                 let id = page_id.as_ref().and_then(serde_json::Value::as_i64);
                 Ok(pages.map_or_else(Page::default, |pages| Page::from_pages(&pages, id)))
             }
@@ -321,10 +326,13 @@ pub(crate) struct Control {
 impl Control {
     /// End an Agent's sessions at once and forget its approval.
     pub async fn disconnect(&self, name: &str) {
-        self.pauses.block_agent(name);
-        for session in self.agents.disconnect(name) {
+        let sessions = self.agents.disconnect(name);
+        for session in sessions {
             let _ = self.sessions.close_session(&session).await;
         }
+        // After the sessions close, so a step that reaches its Pause in
+        // between is blocked too.
+        self.pauses.block_agent(name);
     }
 
     /// Keep the connected list to sessions that are still open.
