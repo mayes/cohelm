@@ -33,6 +33,28 @@ jobs:
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
+      # Temporary: tells whether Chrome's child processes start on this Mac
+      # runner when launched from a shell, with a port and with the pipe.
+      - name: Mac Chrome launch check (temporary)
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        shell: bash
+        env:
+          CHROME: ${{ steps.chrome.outputs.chrome-path }}
+        run: |
+          for mode in port pipe; do
+            dir=$(mktemp -d)
+            if [ "$mode" = port ]; then
+              "$CHROME" --headless=new --no-first-run --user-data-dir="$dir" --remote-debugging-port=0 about:blank 2>"$dir/err" &
+            else
+              "$CHROME" --headless=new --no-first-run --user-data-dir="$dir" --remote-debugging-pipe about:blank 3</dev/null 4>/dev/null 2>"$dir/err" &
+            fi
+            pid=$!
+            sleep 10
+            kill "$pid" 2>/dev/null || true
+            echo "== $mode: rendezvous errors: $(grep -c MachPortRendezvous "$dir/err" || true)"
+            grep -m3 -E "Rendezvous|crashed" "$dir/err" || true
+          done
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
