@@ -85,9 +85,38 @@ fn uid_where(snapshot: &str, text: &str) -> String {
         .to_owned()
 }
 
+/// The compose tab's id. Chrome DevTools MCP routes page tools by pageId,
+/// so every call below names it.
+async fn tab(agent: &Peer<RoleClient>) -> u64 {
+    for _ in 0..50 {
+        let pages = agent
+            .call_tool(CallToolRequestParams::new("list_pages"))
+            .await
+            .unwrap();
+        let pages = text_of(&pages);
+        if let Some(line) = pages.lines().find(|l| l.contains("/compose")) {
+            return line
+                .split(':')
+                .next()
+                .and_then(|id| id.trim().parse().ok())
+                .expect("tab has an id");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("the compose tab is listed");
+}
+
+/// `arguments` with the compose tab's id added.
+async fn on_tab(agent: &Peer<RoleClient>, mut arguments: Value) -> Value {
+    let id = tab(agent).await;
+    arguments["pageId"] = json!(id);
+    arguments
+}
+
 async fn snapshot(agent: &Peer<RoleClient>) -> String {
+    let arguments = on_tab(agent, json!({})).await;
     let result = agent
-        .call_tool(CallToolRequestParams::new("take_snapshot").with_arguments(args(json!({}))))
+        .call_tool(CallToolRequestParams::new("take_snapshot").with_arguments(args(arguments)))
         .await
         .unwrap();
     assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
@@ -95,13 +124,14 @@ async fn snapshot(agent: &Peer<RoleClient>) -> String {
 }
 
 async fn click(agent: &Peer<RoleClient>, uid: &str) -> Result<CallToolResult, rmcp::ServiceError> {
-    let mut request =
-        CallToolRequestParams::new("click").with_arguments(args(json!({ "uid": uid })));
+    let arguments = on_tab(agent, json!({ "uid": uid })).await;
+    let mut request = CallToolRequestParams::new("click").with_arguments(args(arguments));
     request.set_progress_token(ProgressToken(NumberOrString::Number(7)));
     agent.call_tool(request).await
 }
 
 async fn call(agent: &Peer<RoleClient>, tool: &'static str, arguments: Value) -> CallToolResult {
+    let arguments = on_tab(agent, arguments).await;
     agent
         .call_tool(CallToolRequestParams::new(tool).with_arguments(args(arguments)))
         .await
@@ -191,13 +221,7 @@ async fn a_risky_step_waits_until_the_person_allows_or_blocks_it() {
     assert!(snapshot(&peer).await.contains("Message sent"));
 
     // Blocked: the Agent is told, and the page never sees it.
-    let reload = peer
-        .call_tool(
-            CallToolRequestParams::new("navigate_page")
-                .with_arguments(args(json!({ "type": "reload" }))),
-        )
-        .await
-        .unwrap();
+    let reload = call(&peer, "navigate_page", json!({ "type": "reload" })).await;
     assert_ne!(reload.is_error, Some(true), "{}", text_of(&reload));
     let page = snapshot(&peer).await;
     let held = tokio::spawn({
