@@ -11,6 +11,9 @@
   },
   "action": {
     "default_title": "Cohelm",
-    "default_popup": "about.html"
-  }
+    "default_popup": "agents.html"
+  },
+  "permissions": [
+    "clipboardWrite"
+  ]
 }

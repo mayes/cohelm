@@ -30,7 +30,7 @@ use axum::{
     routing::get,
 };
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::{browser::LaunchedBrowser, config::HelperError};
@@ -54,6 +54,8 @@ const CLOSE_GRACE: Duration = Duration::from_secs(5);
 const CLIENT_BACKLOG: usize = 4096;
 /// Commands waiting for the browser to read them.
 const PIPE_BACKLOG: usize = 4096;
+/// Events waiting for the Helper's own watchers.
+const WATCH_BACKLOG: usize = 256;
 
 /// A running bridge.
 pub(crate) struct Bridge {
@@ -63,6 +65,7 @@ pub(crate) struct Bridge {
     /// Taken once the browser has exited.
     exited: Option<oneshot::Receiver<()>>,
     events: mpsc::UnboundedSender<Event>,
+    watchers: broadcast::Sender<Value>,
     cancel: CancellationToken,
 }
 
@@ -81,6 +84,7 @@ impl Bridge {
     pub fn asker(&self) -> Asker {
         Asker {
             events: self.events.clone(),
+            watchers: self.watchers.clone(),
         }
     }
 
@@ -99,14 +103,57 @@ impl Bridge {
 #[derive(Clone)]
 pub(crate) struct Asker {
     events: mpsc::UnboundedSender<Event>,
+    watchers: broadcast::Sender<Value>,
 }
 
 impl Asker {
     /// Send a command and wait for its result.
     pub async fn ask(&self, method: &str, params: Value) -> Result<Value, HelperError> {
+        self.send(Command::Browser, method, params).await
+    }
+
+    /// Send a command to a target the Helper attached to itself.
+    pub async fn ask_in(
+        &self,
+        session: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, HelperError> {
+        self.send(Command::Session(session.to_owned()), method, params)
+            .await
+    }
+
+    /// Attach to a target for the Helper's own use, apart from any client,
+    /// and return the session. Its events come through [`Asker::watch`].
+    pub async fn attach(&self, target: &str) -> Result<String, HelperError> {
+        let attached = self
+            .send(
+                Command::Attach(target.to_owned()),
+                "Target.attachToTarget",
+                json!({ "targetId": target, "flatten": true }),
+            )
+            .await?;
+        attached["sessionId"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| HelperError::BrowserUnreachable("attached without a session".into()))
+    }
+
+    /// The browser's target events, and every event from the Helper's own
+    /// sessions. One who falls behind misses some.
+    pub fn watch(&self) -> broadcast::Receiver<Value> {
+        self.watchers.subscribe()
+    }
+
+    async fn send(
+        &self,
+        command: Command,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, HelperError> {
         let (answer, answered) = oneshot::channel();
         self.events
-            .send(Event::Ask(method.to_owned(), params, answer))
+            .send(Event::Ask(command, method.to_owned(), params, answer))
             .map_err(|_| HelperError::BrowserClosed)?;
         tokio::time::timeout(ASK_TIMEOUT, answered)
             .await
@@ -130,7 +177,20 @@ enum Event {
     Disconnected(u64),
     Close,
     /// A command of the Helper's own, answered with its result or error.
-    Ask(String, Value, oneshot::Sender<Result<Value, String>>),
+    Ask(
+        Command,
+        String,
+        Value,
+        oneshot::Sender<Result<Value, String>>,
+    ),
+}
+
+/// Where one of the Helper's own commands goes.
+enum Command {
+    Browser,
+    Session(String),
+    /// Attaching to this target for the Helper.
+    Attach(String),
 }
 
 #[derive(Clone)]
@@ -151,6 +211,7 @@ pub(crate) async fn start(browser: LaunchedBrowser) -> Result<Bridge, HelperErro
     let addr: SocketAddr = listener.local_addr()?;
     let cancel = CancellationToken::new();
     let (events, inbox) = mpsc::unbounded_channel();
+    let watchers = broadcast::channel(WATCH_BACKLOG).0;
 
     // Blocking threads read and write the pipe, the same on every platform.
     let reader_events = events.clone();
@@ -160,7 +221,7 @@ pub(crate) async fn start(browser: LaunchedBrowser) -> Result<Bridge, HelperErro
 
     let (close, close_requested) = oneshot::channel::<()>();
     let (exited_tx, exited) = oneshot::channel();
-    tokio::spawn(Relay::new(to_pipe).run(inbox));
+    tokio::spawn(Relay::new(to_pipe, watchers.clone()).run(inbox));
     tokio::spawn({
         let events = events.clone();
         async move {
@@ -205,6 +266,7 @@ pub(crate) async fn start(browser: LaunchedBrowser) -> Result<Bridge, HelperErro
         close: Some(close),
         exited: Some(exited),
         events,
+        watchers,
         cancel,
     })
 }
@@ -268,10 +330,19 @@ struct Relay {
     own_id: u64,
     /// The Helper's own commands still waiting on the browser.
     asked: HashMap<u64, oneshot::Sender<Result<Value, String>>>,
+    /// The Helper's own attaches still waiting, by command id, to the target.
+    attaching: HashMap<u64, String>,
+    /// News of an attach to a target the Helper is attaching to, held until
+    /// its reply says whether the attach is the Helper's or the client's.
+    held: HashMap<String, Vec<String>>,
+    /// Sessions the Helper attached for itself. The client never hears of
+    /// them.
+    own_sessions: HashSet<String>,
+    watchers: broadcast::Sender<Value>,
 }
 
 impl Relay {
-    fn new(to_pipe: mpsc::Sender<String>) -> Self {
+    fn new(to_pipe: mpsc::Sender<String>, watchers: broadcast::Sender<Value>) -> Self {
         Self {
             to_pipe,
             client: None,
@@ -279,6 +350,10 @@ impl Relay {
             next_id: 0,
             own_id: OWN_IDS - 1,
             asked: HashMap::new(),
+            attaching: HashMap::new(),
+            held: HashMap::new(),
+            own_sessions: HashSet::new(),
+            watchers,
         }
     }
 
@@ -307,10 +382,20 @@ impl Relay {
                 Event::Close => {
                     self.send_own("Browser.close", json!({}), None).await;
                 }
-                Event::Ask(method, params, answer) => {
+                Event::Ask(command, method, params, answer) => {
                     // Forget commands whose asker gave up waiting.
                     self.asked.retain(|_, waiting| !waiting.is_closed());
-                    let id = self.send_own(&method, params, None).await;
+                    let id = match command {
+                        Command::Browser => self.send_own(&method, params, None).await,
+                        Command::Session(session) => {
+                            self.send_own(&method, params, Some(&session)).await
+                        }
+                        Command::Attach(target) => {
+                            let id = self.send_own(&method, params, None).await;
+                            self.attaching.insert(id, target);
+                            id
+                        }
+                    };
                     self.asked.insert(id, answer);
                 }
                 Event::BrowserGone => break,
@@ -341,6 +426,27 @@ impl Relay {
             return;
         };
         if let Some(id) = message.get("id").and_then(Value::as_u64) {
+            if let Some(target) = self.attaching.remove(&id) {
+                let ours = message.pointer("/result/sessionId").and_then(Value::as_str);
+                if let Some(session) = ours {
+                    self.own_sessions.insert(session.to_owned());
+                }
+                // Pass on any attach to the same target that was the client's.
+                let theirs: Vec<String> = self
+                    .held
+                    .remove(&target)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|text| {
+                        serde_json::from_str::<Value>(text).ok().is_some_and(|m| {
+                            m.pointer("/params/sessionId").and_then(Value::as_str) != ours
+                        })
+                    })
+                    .collect();
+                for text in theirs {
+                    Box::pin(self.on_browser_message(text)).await;
+                }
+            }
             if let Some(answer) = self.asked.remove(&id) {
                 let result = match message.get("error") {
                     Some(error) => Err(error.to_string()),
@@ -375,6 +481,35 @@ impl Relay {
             .pointer("/params/sessionId")
             .and_then(Value::as_str)
             .map(str::to_owned);
+
+        // The Helper's own sessions, and what it watches of the browser.
+        if parent
+            .as_ref()
+            .is_some_and(|p| self.own_sessions.contains(p))
+        {
+            let _ = self.watchers.send(message);
+            return;
+        }
+        match (method, &session) {
+            (Some("Target.attachedToTarget"), Some(_)) if parent.is_none() => {
+                let target = message
+                    .pointer("/params/targetInfo/targetId")
+                    .and_then(Value::as_str);
+                if let Some(target) = target.filter(|t| self.attaching.values().any(|a| a == t)) {
+                    self.held.entry(target.to_owned()).or_default().push(text);
+                    return;
+                }
+            }
+            (Some("Target.detachedFromTarget"), Some(gone)) if self.own_sessions.remove(gone) => {
+                let _ = self.watchers.send(message);
+                return;
+            }
+            (Some(m), _) if parent.is_none() && m.starts_with("Target.target") => {
+                let _ = self.watchers.send(message.clone());
+            }
+            _ => {}
+        }
+
         match (method, session, &mut self.client) {
             (Some("Target.attachedToTarget"), Some(session), Some(client)) => {
                 let ours = parent.as_ref().is_none_or(|p| client.sessions.contains(p));
@@ -573,7 +708,7 @@ mod tests {
     #[test]
     fn ids_stay_within_what_chromium_reads() {
         let (to_pipe, _outbox) = mpsc::channel(1);
-        let mut relay = Relay::new(to_pipe);
+        let mut relay = Relay::new(to_pipe, broadcast::channel(1).0);
         assert_eq!(relay.next_relay_id(), 1);
         assert_eq!(relay.next_own_id(), OWN_IDS);
         relay.next_id = OWN_IDS - 1;
@@ -584,6 +719,73 @@ mod tests {
         );
         relay.own_id = MAX_ID;
         assert_eq!(relay.next_own_id(), OWN_IDS, "own ids go round at MAX_ID");
+    }
+
+    #[tokio::test]
+    async fn the_helpers_own_sessions_stay_apart_from_the_clients() {
+        let (to_pipe, mut pipe) = mpsc::channel(16);
+        let watchers = broadcast::channel(16).0;
+        let mut watch = watchers.subscribe();
+        let (events, inbox) = mpsc::unbounded_channel();
+        tokio::spawn(Relay::new(to_pipe, watchers).run(inbox));
+        let (client, mut heard) = mpsc::channel(16);
+        events.send(Event::Connected(1, client)).unwrap();
+        let from_browser = |m: Value| events.send(Event::FromBrowser(m.to_string())).unwrap();
+        let attach = |target: &str| {
+            let (answer, answered) = oneshot::channel();
+            events
+                .send(Event::Ask(
+                    Command::Attach(target.into()),
+                    "Target.attachToTarget".into(),
+                    json!({ "targetId": target, "flatten": true }),
+                    answer,
+                ))
+                .unwrap();
+            answered
+        };
+        let sent_id = |text: String| serde_json::from_str::<Value>(&text).unwrap()["id"].clone();
+        let attached = |session: &str, target: &str| {
+            json!({ "method": "Target.attachedToTarget", "params": {
+                "sessionId": session, "targetInfo": { "targetId": target }, "waitingForDebugger": false } })
+        };
+
+        // The Helper's attach: the client never hears of it.
+        let answered = attach("T1");
+        let id = sent_id(pipe.recv().await.unwrap());
+        from_browser(attached("own", "T1"));
+        from_browser(json!({ "id": id, "result": { "sessionId": "own" } }));
+        assert_eq!(answered.await.unwrap().unwrap()["sessionId"], "own");
+        from_browser(
+            json!({ "sessionId": "own", "method": "Runtime.bindingCalled", "params": {} }),
+        );
+        let seen = tokio::time::timeout(Duration::from_secs(1), watch.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(seen["method"], "Runtime.bindingCalled");
+
+        // The client's attach to a target the Helper is attaching to still
+        // reaches the client.
+        let answered = attach("T2");
+        let id = sent_id(pipe.recv().await.unwrap());
+        from_browser(attached("theirs", "T2"));
+        from_browser(attached("own2", "T2"));
+        from_browser(json!({ "id": id, "result": { "sessionId": "own2" } }));
+        answered.await.unwrap().unwrap();
+        let got: Value = serde_json::from_str(
+            &tokio::time::timeout(Duration::from_secs(1), heard.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(got["params"]["sessionId"], "theirs");
+        from_browser(json!({ "sessionId": "own2", "method": "Runtime.consoleAPICalled" }));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            heard.try_recv().is_err(),
+            "the client hears nothing of the Helper's sessions"
+        );
     }
 
     #[test]

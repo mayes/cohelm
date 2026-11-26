@@ -155,3 +155,115 @@ async fn an_allowed_agent_comes_back_without_asking_until_disconnected() {
     let _ = regular.cancel().await;
     helper.stop().await;
 }
+
+/// Run `script` in Cohelm's page `page` once it shows what `ready` checks.
+async fn in_page(
+    helper: &RunningHelper,
+    page: &str,
+    ready: &str,
+    script: &str,
+) -> serde_json::Value {
+    let probe = helper.probe();
+    let mut last = None;
+    for _ in 0..150 {
+        last = probe.run_in_cohelm_page(page, ready).await.ok().flatten();
+        if last.as_ref().is_some_and(|v| v == &json!(true)) {
+            return probe
+                .run_in_cohelm_page(page, script)
+                .await
+                .expect("the script runs")
+                .expect("the page is open");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("{page} never showed {ready}: {last:?}");
+}
+
+#[tokio::test]
+async fn the_person_answers_in_cohelms_prompt_and_agents_list() {
+    let Some(chrome) = test_chrome() else {
+        return;
+    };
+    let site = start_site().await;
+    let profile = tempfile::tempdir().unwrap();
+    let mut config = helper_config(chrome, profile.path(), &format!("{site}/sign-in"));
+    config.approval_wait = Duration::from_secs(30);
+    let helper = start(config).await.expect("Helper starts");
+
+    // A new Agent's first call opens Cohelm's prompt, which names it.
+    let asker = connect_as("prompted", &helper.mcp_url).await.unwrap();
+    let held = tokio::spawn(async move {
+        let result = list_pages(&asker).await;
+        (asker, result)
+    });
+    let named = in_page(
+        &helper,
+        "allow.html",
+        "!document.getElementById('prompt').hidden",
+        "document.getElementById('agent').textContent",
+    )
+    .await;
+    assert_eq!(named, json!("prompted"));
+    in_page(
+        &helper,
+        "allow.html",
+        "true",
+        "document.getElementById('allow').click(); true",
+    )
+    .await;
+    let (asker, result) = tokio::time::timeout(Duration::from_secs(10), held)
+        .await
+        .expect("the call goes ahead once allowed")
+        .unwrap();
+    let result = result.unwrap();
+    assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+    assert_eq!(helper.agents().snapshot().allowed, ["prompted"]);
+
+    // The Agents list shows it, connected, with the details to connect more.
+    helper
+        .probe()
+        .open_cohelm_page("agents.html")
+        .await
+        .unwrap();
+    let listed = in_page(
+        &helper,
+        "agents.html",
+        "document.querySelectorAll('#allowed .row').length > 0",
+        "[...document.querySelectorAll('#allowed .row')].map(r => r.textContent)",
+    )
+    .await;
+    assert_eq!(listed, json!(["promptedconnectedDisconnect"]));
+    let shown = in_page(
+        &helper,
+        "agents.html",
+        "true",
+        "document.getElementById('url').textContent",
+    )
+    .await;
+    assert_eq!(shown, json!(helper.mcp_url));
+
+    // Disconnecting from the list ends the session at once.
+    in_page(
+        &helper,
+        "agents.html",
+        "true",
+        "document.querySelector('#allowed .row[data-agent=\"prompted\"] button').click(); true",
+    )
+    .await;
+    let mut changed = helper.agents().watch();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !helper.agents().snapshot().allowed.is_empty() {
+            changed.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("the Agent is disconnected");
+    let after = list_pages(&asker).await;
+    assert!(
+        after.as_ref().is_err() || after.as_ref().is_ok_and(|r| r.is_error == Some(true)),
+        "the disconnected session can't call: {after:?}"
+    );
+
+    let _ = asker.cancel().await;
+    helper.stop().await;
+}

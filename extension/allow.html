@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Allow an Agent? · Cohelm</title>
+    <link rel="stylesheet" href="cohelm.css">
+  </head>
+  <body>
+    <main id="waiting">
+      <p class="muted">Connecting to Cohelm…</p>
+    </main>
+    <main id="prompt" hidden>
+      <h1><span id="agent"></span> wants to use your browser</h1>
+      <p class="muted">If you allow it, it can read and act in your tabs, on the sites you're signed in to. Cohelm still asks you before it sends, pays, submits or deletes anything.</p>
+      <p class="muted">Only allow an app you set up yourself.</p>
+      <div class="actions">
+        <button id="allow" class="primary">Allow</button>
+        <button id="decline">Decline</button>
+      </div>
+    </main>
+    <main id="done" hidden>
+      <p class="muted">Answered. You can close this window.</p>
+    </main>
+    <script type="module" src="allow.js"></script>
+  </body>
+</html>

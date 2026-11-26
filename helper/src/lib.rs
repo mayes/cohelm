@@ -8,6 +8,7 @@ mod bridge;
 mod browser;
 mod config;
 mod layout;
+mod pages;
 mod server;
 
 /// Cohelm's built-in extension, fixed by the key in `extension/manifest.json`.

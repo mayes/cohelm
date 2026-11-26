@@ -24,6 +24,7 @@ use crate::{
     backend::{self, Backend},
     bridge, browser,
     config::{HelperConfig, HelperError},
+    pages,
 };
 
 /// The name the Helper gives Agents, and checks for when a second Cohelm
@@ -237,6 +238,75 @@ impl BrowserProbe {
             .collect())
     }
 
+    /// Open one of Cohelm's own pages, such as `agents.html`, in a new
+    /// window, as the person does from the toolbar. For tests.
+    pub async fn open_cohelm_page(&self, page: &str) -> Result<(), HelperError> {
+        self.browser
+            .ask(
+                "Target.createTarget",
+                serde_json::json!({
+                    "url": format!("chrome-extension://{}/{page}", crate::EXTENSION_ID),
+                    "newWindow": true,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Run `script` in the open Cohelm page whose address ends with `page`,
+    /// as the person would act there, and return what it gives back. For
+    /// tests of Cohelm's pages; None when no such page is open.
+    pub async fn run_in_cohelm_page(
+        &self,
+        page: &str,
+        script: &str,
+    ) -> Result<Option<serde_json::Value>, HelperError> {
+        let targets = self
+            .browser
+            .ask("Target.getTargets", serde_json::json!({}))
+            .await?;
+        let prefix = format!("chrome-extension://{}/", crate::EXTENSION_ID);
+        let Some(target) = targets["targetInfos"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|t| {
+                t["url"].as_str().is_some_and(|u| {
+                    u.starts_with(&prefix)
+                        && u.split(['?', '#'])
+                            .next()
+                            .is_some_and(|u| u.ends_with(page))
+                })
+            })
+            .and_then(|t| t["targetId"].as_str())
+        else {
+            return Ok(None);
+        };
+        let session = self.browser.attach(target).await?;
+        let result = self
+            .browser
+            .ask_in(
+                &session,
+                "Runtime.evaluate",
+                serde_json::json!({ "expression": script, "awaitPromise": true, "returnByValue": true }),
+            )
+            .await;
+        let _ = self
+            .browser
+            .ask(
+                "Target.detachFromTarget",
+                serde_json::json!({ "sessionId": session }),
+            )
+            .await;
+        let result = result?;
+        if let Some(thrown) = result.get("exceptionDetails") {
+            return Err(HelperError::BrowserUnreachable(format!(
+                "the page threw: {thrown}"
+            )));
+        }
+        Ok(Some(result["result"]["value"].clone()))
+    }
+
     /// Whether Cohelm's built-in extension is running in the browser.
     pub async fn extension_running(&self) -> Result<bool, HelperError> {
         let targets = self
@@ -348,6 +418,15 @@ pub async fn start(config: HelperConfig) -> Result<RunningHelper, HelperError> {
             .enforce_origin_validation()
             .with_cancellation_token(cancel.child_token()),
     );
+    let mcp_url = format!("http://{addr}/mcp");
+    if config.browser.extension_dir.is_some() {
+        tokio::spawn(pages::run(
+            browser.clone(),
+            control.clone(),
+            mcp_url.clone(),
+            cancel.child_token(),
+        ));
+    }
     let router = axum::Router::new()
         .nest_service("/mcp", service)
         .layer(axum::middleware::from_fn(only_this_computer));
@@ -397,7 +476,7 @@ pub async fn start(config: HelperConfig) -> Result<RunningHelper, HelperError> {
         }
     });
     Ok(RunningHelper {
-        mcp_url: format!("http://{addr}/mcp"),
+        mcp_url,
         addr,
         _stop_on_drop: cancel.clone().drop_guard(),
         cancel,
@@ -436,7 +515,11 @@ mod tests {
         ] {
             assert!(browser_own_page(url), "{url}");
         }
-        for url in ["https://example.com", "about:blank", "http://chrome.example"] {
+        for url in [
+            "https://example.com",
+            "about:blank",
+            "http://chrome.example",
+        ] {
             assert!(!browser_own_page(url), "{url}");
         }
     }

@@ -25,7 +25,7 @@ use serde_json::{Map, Value};
 
 /// A page of Cohelm's built-in extension. Its ID comes from the key in
 /// extension/manifest.json.
-pub const EXTENSION_PAGE: &str = "chrome-extension://dojelhkgldmdbffaafmofoilmbbacppo/about.html";
+pub const EXTENSION_PAGE: &str = "chrome-extension://dojelhkgldmdbffaafmofoilmbbacppo/agents.html";
 
 pub type Agent = rmcp::service::RunningService<rmcp::RoleClient, ClientConfig>;
 
