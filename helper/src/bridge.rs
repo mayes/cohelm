@@ -6,12 +6,14 @@
 //! from the pipe. The secret reaches Chrome DevTools MCP in a config file only
 //! this user can read, not on its command line (ADR 0005).
 //!
-//! One client is relayed at a time. When it goes, the Helper detaches the
-//! sessions it opened and turns off its auto-attach, so the person's new tabs
-//! never wait on a client that's no longer there.
+//! One client is relayed at a time. The relay gives each of the client's
+//! commands an id of its own, so a reply only ever reaches the client that
+//! asked, even across a reconnect. When a client goes, the Helper turns off
+//! its auto-attach and lets go of its tabs, so the person's new tabs never
+//! wait on a client that's no longer there.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::{BufRead, BufReader, Write},
     net::SocketAddr,
     time::Duration,
@@ -40,13 +42,19 @@ const OWN_IDS: u64 = 1 << 50;
 const MAX_MESSAGE: usize = 256 << 20;
 /// How long the browser gets to close by itself before it's stopped.
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
+/// Messages waiting for a client. One that falls this far behind is dropped,
+/// rather than the Helper holding the browser's output in memory.
+const CLIENT_BACKLOG: usize = 4096;
+/// Commands waiting for the browser to read them.
+const PIPE_BACKLOG: usize = 4096;
 
 /// A running bridge.
 pub(crate) struct Bridge {
     /// For Chrome DevTools MCP's `wsEndpoint`. Holds the secret.
     pub ws_url: String,
     close: Option<oneshot::Sender<()>>,
-    exited: oneshot::Receiver<()>,
+    /// Taken once the browser has exited.
+    exited: Option<oneshot::Receiver<()>>,
     cancel: CancellationToken,
 }
 
@@ -57,14 +65,17 @@ impl Bridge {
         if let Some(close) = self.close.take() {
             let _ = close.send(());
         }
-        let _ = (&mut self.exited).await;
+        self.browser_exited().await;
         self.cancel.cancel();
     }
 
     /// Resolves when the browser has exited, for example because the person
-    /// quit it.
+    /// quit it. Safe to call again afterwards.
     pub async fn browser_exited(&mut self) {
-        let _ = (&mut self.exited).await;
+        if let Some(exited) = self.exited.as_mut() {
+            let _ = exited.await;
+            self.exited = None;
+        }
     }
 }
 
@@ -77,7 +88,7 @@ impl Drop for Bridge {
 enum Event {
     FromBrowser(String),
     BrowserGone,
-    Connected(u64, mpsc::UnboundedSender<String>),
+    Connected(u64, mpsc::Sender<String>),
     FromClient(u64, String),
     Disconnected(u64),
     Close,
@@ -105,12 +116,12 @@ pub(crate) async fn start(browser: LaunchedBrowser) -> Result<Bridge, HelperErro
     // Blocking threads read and write the pipe, the same on every platform.
     let reader_events = events.clone();
     std::thread::spawn(move || read_pipe(from_browser, reader_events));
-    let (to_pipe, pipe_outbox) = std::sync::mpsc::channel::<String>();
+    let (to_pipe, pipe_outbox) = mpsc::channel::<String>(PIPE_BACKLOG);
     std::thread::spawn(move || write_pipe(to_browser, pipe_outbox));
 
     let (close, close_requested) = oneshot::channel::<()>();
     let (exited_tx, exited) = oneshot::channel();
-    tokio::spawn(relay(inbox, to_pipe));
+    tokio::spawn(Relay::new(to_pipe).run(inbox));
     tokio::spawn({
         let events = events.clone();
         async move {
@@ -153,7 +164,7 @@ pub(crate) async fn start(browser: LaunchedBrowser) -> Result<Bridge, HelperErro
     Ok(Bridge {
         ws_url: format!("ws://{addr}/devtools/browser/{secret}"),
         close: Some(close),
-        exited,
+        exited: Some(exited),
         cancel,
     })
 }
@@ -185,8 +196,8 @@ fn read_pipe(from_browser: std::io::PipeReader, events: mpsc::UnboundedSender<Ev
     let _ = events.send(Event::BrowserGone);
 }
 
-fn write_pipe(mut to_browser: std::io::PipeWriter, outbox: std::sync::mpsc::Receiver<String>) {
-    for message in outbox {
+fn write_pipe(mut to_browser: std::io::PipeWriter, mut outbox: mpsc::Receiver<String>) {
+    while let Some(message) = outbox.blocking_recv() {
         let written = to_browser
             .write_all(message.as_bytes())
             .and_then(|()| to_browser.write_all(&[0]))
@@ -197,112 +208,206 @@ fn write_pipe(mut to_browser: std::io::PipeWriter, outbox: std::sync::mpsc::Rece
     }
 }
 
-/// What the relay knows about the client it serves now.
-#[derive(Default)]
+/// The client the relay serves now.
 struct Client {
     id: u64,
-    tx: Option<mpsc::UnboundedSender<String>>,
-    /// Top-level sessions the browser attached for this client.
+    tx: mpsc::Sender<String>,
+    /// Every session the browser attached for this client.
     sessions: HashSet<String>,
+    /// The top-level ones, which the relay lets go of when the client goes.
+    roots: HashSet<String>,
 }
 
-async fn relay(
-    mut inbox: mpsc::UnboundedReceiver<Event>,
-    to_pipe: std::sync::mpsc::Sender<String>,
-) {
-    let mut client = Client::default();
-    let mut own_id = OWN_IDS;
-    let mut send_own = |method: &str, params: Value| {
-        own_id += 1;
-        let message = json!({ "id": own_id, "method": method, "params": params });
-        let _ = to_pipe.send(message.to_string());
-    };
-    while let Some(event) = inbox.recv().await {
-        match event {
-            Event::FromBrowser(text) => {
-                let parsed: Option<Value> = serde_json::from_str(&text).ok();
-                if let Some(message) = &parsed {
-                    if message
-                        .get("id")
-                        .and_then(Value::as_u64)
-                        .is_some_and(|id| id > OWN_IDS)
-                    {
-                        continue;
-                    }
-                    track_sessions(&mut client.sessions, message);
-                }
-                if let Some(tx) = &client.tx {
-                    let _ = tx.send(text);
-                }
-            }
-            Event::Connected(id, tx) => {
-                if client.tx.is_some() {
-                    tracing::info!("a new DevTools client replaces the old one");
-                    release(&mut client, &mut send_own);
-                }
-                client = Client {
-                    id,
-                    tx: Some(tx),
-                    sessions: HashSet::new(),
-                };
-            }
-            Event::FromClient(id, text) => {
-                if id == client.id && client.tx.is_some() {
-                    let _ = to_pipe.send(text);
-                }
-            }
-            Event::Disconnected(id) => {
-                if id == client.id && client.tx.is_some() {
-                    release(&mut client, &mut send_own);
-                }
-            }
-            Event::Close => {
-                send_own("Browser.close", json!({}));
-            }
-            Event::BrowserGone => break,
+struct Relay {
+    to_pipe: mpsc::Sender<String>,
+    client: Option<Client>,
+    /// The relay's id for each command still waiting on the browser, with
+    /// the client that sent it and that client's own id.
+    pending: HashMap<u64, (u64, Value)>,
+    next_id: u64,
+    own_id: u64,
+}
+
+impl Relay {
+    fn new(to_pipe: mpsc::Sender<String>) -> Self {
+        Self {
+            to_pipe,
+            client: None,
+            pending: HashMap::new(),
+            next_id: 0,
+            own_id: OWN_IDS,
         }
     }
-    // Closing the client's channel ends its WebSocket.
-    client.tx = None;
-}
 
-/// Undo what a departed client left switched on in the browser.
-fn release(client: &mut Client, send_own: &mut impl FnMut(&str, Value)) {
-    client.tx = None;
-    send_own(
-        "Target.setAutoAttach",
-        json!({ "autoAttach": false, "waitForDebuggerOnStart": false, "flatten": true }),
-    );
-    send_own("Target.setDiscoverTargets", json!({ "discover": false }));
-    for session in client.sessions.drain() {
-        send_own("Target.detachFromTarget", json!({ "sessionId": session }));
+    async fn run(mut self, mut inbox: mpsc::UnboundedReceiver<Event>) {
+        while let Some(event) = inbox.recv().await {
+            match event {
+                Event::FromBrowser(text) => self.on_browser_message(text).await,
+                Event::FromClient(id, text) => self.on_client_message(id, text).await,
+                Event::Connected(id, tx) => {
+                    if self.client.is_some() {
+                        tracing::info!("a new DevTools client replaces the old one");
+                        self.release().await;
+                    }
+                    self.client = Some(Client {
+                        id,
+                        tx,
+                        sessions: HashSet::new(),
+                        roots: HashSet::new(),
+                    });
+                }
+                Event::Disconnected(id) => {
+                    if self.client.as_ref().is_some_and(|c| c.id == id) {
+                        self.release().await;
+                    }
+                }
+                Event::Close => self.send_own("Browser.close", json!({}), None).await,
+                Event::BrowserGone => break,
+            }
+        }
+        // Dropping the client's sender ends its WebSocket.
     }
-}
 
-/// Keep the list of top-level sessions current. Sessions inside a page end
-/// with it.
-fn track_sessions(sessions: &mut HashSet<String>, message: &Value) {
-    if message.get("sessionId").is_some() {
-        return;
+    async fn on_client_message(&mut self, client_id: u64, text: String) {
+        if self.client.as_ref().is_none_or(|c| c.id != client_id) {
+            return;
+        }
+        let Ok(mut message) = serde_json::from_str::<Value>(&text) else {
+            return;
+        };
+        if let Some(own) = message.get_mut("id") {
+            self.next_id += 1;
+            let relay_id = self.next_id;
+            debug_assert!(relay_id < OWN_IDS);
+            self.pending.insert(
+                relay_id,
+                (client_id, std::mem::replace(own, relay_id.into())),
+            );
+        }
+        let _ = self.to_pipe.send(message.to_string()).await;
     }
-    let session = || {
-        message
+
+    async fn on_browser_message(&mut self, text: String) {
+        let Ok(mut message) = serde_json::from_str::<Value>(&text) else {
+            return;
+        };
+        if let Some(id) = message.get("id").and_then(Value::as_u64) {
+            // A reply: back to the client that asked, under its own id, and
+            // to no one else.
+            let Some((asker, own)) = self.pending.remove(&id) else {
+                return;
+            };
+            if self.client.as_ref().is_some_and(|c| c.id == asker) {
+                message["id"] = own;
+                self.send_to_client(message.to_string()).await;
+            }
+            return;
+        }
+
+        let parent = message
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let method = message.get("method").and_then(Value::as_str);
+        let session = message
             .pointer("/params/sessionId")
             .and_then(Value::as_str)
-            .map(str::to_owned)
-    };
-    match message.get("method").and_then(Value::as_str) {
-        Some("Target.attachedToTarget") => {
-            if let Some(id) = session() {
-                sessions.insert(id);
+            .map(str::to_owned);
+        match (method, session, &mut self.client) {
+            (Some("Target.attachedToTarget"), Some(session), Some(client)) => {
+                let ours = parent.as_ref().is_none_or(|p| client.sessions.contains(p));
+                if !ours {
+                    return;
+                }
+                if parent.is_none() {
+                    client.roots.insert(session.clone());
+                }
+                client.sessions.insert(session);
             }
-        }
-        Some("Target.detachedFromTarget") => {
-            if let Some(id) = session() {
-                sessions.remove(&id);
+            (Some("Target.attachedToTarget"), Some(session), None) => {
+                // Attached as the last client left: let the tab go on.
+                if parent.is_none() {
+                    let session = session.clone();
+                    self.let_go(&session).await;
+                }
+                return;
             }
+            (Some("Target.detachedFromTarget"), Some(session), Some(client)) => {
+                client.sessions.remove(&session);
+                client.roots.remove(&session);
+                if parent
+                    .as_ref()
+                    .is_some_and(|p| !client.sessions.contains(p))
+                {
+                    return;
+                }
+            }
+            (_, _, Some(client)) => {
+                // Events inside a session go only to the client that owns it.
+                if parent
+                    .as_ref()
+                    .is_some_and(|p| !client.sessions.contains(p))
+                {
+                    return;
+                }
+            }
+            (_, _, None) => return,
         }
-        _ => {}
+        self.send_to_client(text).await;
+    }
+
+    async fn send_to_client(&mut self, text: String) {
+        let Some(client) = &self.client else {
+            return;
+        };
+        if let Err(mpsc::error::TrySendError::Full(_)) = client.tx.try_send(text) {
+            tracing::warn!("the DevTools client fell behind; disconnecting it");
+            self.release().await;
+        }
+    }
+
+    /// Undo what a departed client left switched on in the browser.
+    async fn release(&mut self) {
+        let Some(client) = self.client.take() else {
+            return;
+        };
+        self.pending.retain(|_, (asker, _)| *asker != client.id);
+        self.send_own(
+            "Target.setAutoAttach",
+            json!({ "autoAttach": false, "waitForDebuggerOnStart": false, "flatten": true }),
+            None,
+        )
+        .await;
+        self.send_own(
+            "Target.setDiscoverTargets",
+            json!({ "discover": false }),
+            None,
+        )
+        .await;
+        for session in &client.roots {
+            self.let_go(session).await;
+        }
+    }
+
+    /// Resume a tab that may be waiting for a debugger, and detach from it.
+    async fn let_go(&mut self, session: &str) {
+        self.send_own("Runtime.runIfWaitingForDebugger", json!({}), Some(session))
+            .await;
+        self.send_own(
+            "Target.detachFromTarget",
+            json!({ "sessionId": session }),
+            None,
+        )
+        .await;
+    }
+
+    async fn send_own(&mut self, method: &str, params: Value, session: Option<&str>) {
+        self.own_id += 1;
+        let mut message = json!({ "id": self.own_id, "method": method, "params": params });
+        if let Some(session) = session {
+            message["sessionId"] = session.into();
+        }
+        let _ = self.to_pipe.send(message.to_string()).await;
     }
 }
 
@@ -336,7 +441,7 @@ fn same_secret(given: &str, expected: &str) -> bool {
 }
 
 async fn serve_client(mut socket: WebSocket, id: u64, events: mpsc::UnboundedSender<Event>) {
-    let (tx, mut outbox) = mpsc::unbounded_channel();
+    let (tx, mut outbox) = mpsc::channel(CLIENT_BACKLOG);
     if events.send(Event::Connected(id, tx)).is_err() {
         return;
     }
@@ -390,26 +495,6 @@ mod tests {
         let b = new_secret().unwrap();
         assert_eq!(a.len(), 64);
         assert_ne!(a, b);
-    }
-
-    #[test]
-    fn top_level_sessions_are_tracked() {
-        let mut sessions = HashSet::new();
-        track_sessions(
-            &mut sessions,
-            &json!({ "method": "Target.attachedToTarget", "params": { "sessionId": "A" } }),
-        );
-        track_sessions(
-            &mut sessions,
-            &json!({ "method": "Target.attachedToTarget", "sessionId": "A",
-                     "params": { "sessionId": "child" } }),
-        );
-        assert_eq!(sessions, HashSet::from(["A".to_owned()]));
-        track_sessions(
-            &mut sessions,
-            &json!({ "method": "Target.detachedFromTarget", "params": { "sessionId": "A" } }),
-        );
-        assert!(sessions.is_empty());
     }
 }
 
@@ -466,18 +551,13 @@ mod pipe_tests {
             .unwrap();
         assert_eq!(next_text(&mut socket).await, command);
 
-        // The Helper's own replies aren't passed on.
-        let own = format!(r#"{{"id":{},"result":{{}}}}"#, OWN_IDS + 7);
+        // The client's ids are its own, whatever they are.
+        let big = format!(r#"{{"id":{},"method":"Target.getTargets"}}"#, OWN_IDS + 7);
         socket
-            .send(tungstenite::Message::Text(own.into()))
+            .send(tungstenite::Message::Text(big.clone().into()))
             .await
             .unwrap();
-        let after = r#"{"id":2,"method":"Target.getTargets"}"#;
-        socket
-            .send(tungstenite::Message::Text(after.into()))
-            .await
-            .unwrap();
-        assert_eq!(next_text(&mut socket).await, after);
+        assert_eq!(next_text(&mut socket).await, big);
 
         // A web page (it sends an Origin) and a wrong secret get nowhere.
         let mut from_page = bridge.ws_url.as_str().into_client_request().unwrap();
@@ -489,5 +569,65 @@ mod pipe_tests {
         assert!(tokio_tungstenite::connect_async(guessed).await.is_err());
 
         bridge.close_browser().await;
+    }
+
+    #[tokio::test]
+    async fn a_new_client_replaces_the_old_one() {
+        use futures::{SinkExt, StreamExt};
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = start(launch(&echo_browser(dir.path())).unwrap())
+            .await
+            .unwrap();
+        let command = r#"{"id":5,"method":"Browser.getVersion"}"#;
+
+        let (mut old, _) = tokio_tungstenite::connect_async(&bridge.ws_url)
+            .await
+            .unwrap();
+        old.send(tungstenite::Message::Text(command.into()))
+            .await
+            .unwrap();
+        assert_eq!(next_text(&mut old).await, command);
+
+        let (mut new, _) = tokio_tungstenite::connect_async(&bridge.ws_url)
+            .await
+            .unwrap();
+        new.send(tungstenite::Message::Text(command.into()))
+            .await
+            .unwrap();
+        assert_eq!(next_text(&mut new).await, command);
+
+        // The old client is let go and hears nothing more.
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match old.next().await {
+                    Some(Ok(tungstenite::Message::Text(text))) => {
+                        panic!("the old client got {text}")
+                    }
+                    Some(Ok(_)) => continue,
+                    _ => break,
+                }
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "the old client's connection ends");
+
+        bridge.close_browser().await;
+    }
+
+    #[tokio::test]
+    async fn quitting_the_browser_ends_the_bridge_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("quick-browser");
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let command = BrowserCommand::new(program, dir.path().join("profile"));
+        let mut bridge = start(launch(&command).unwrap()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), bridge.browser_exited())
+            .await
+            .expect("the bridge sees the browser exit");
+        // The Helper closes the bridge after the browser has gone.
+        tokio::time::timeout(Duration::from_secs(5), bridge.close_browser())
+            .await
+            .expect("closing after the browser has gone returns at once");
     }
 }

@@ -73,7 +73,9 @@ fn refused(request: &CallToolRequestParams) -> Option<&'static str> {
 }
 
 /// A running Helper. Calling [`RunningHelper::stop`] closes the browser and
-/// shuts the Helper down; dropping it stops both straight away.
+/// waits for the Helper to shut down. Dropping it starts the same shutdown
+/// without waiting; the browser is stopped outright if the program ends
+/// first.
 pub struct RunningHelper {
     /// Where Agents connect, for example `http://127.0.0.1:47600/mcp`.
     pub mcp_url: String,
@@ -100,6 +102,10 @@ impl RunningHelper {
     }
 }
 
+/// How long Chrome DevTools MCP gets to start and reach the browser. The
+/// first run may download it.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Start the browser, attach to it and start serving Agents.
 pub async fn start(config: HelperConfig) -> Result<RunningHelper, HelperError> {
     config.validate()?;
@@ -107,12 +113,26 @@ pub async fn start(config: HelperConfig) -> Result<RunningHelper, HelperError> {
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;
     let mut bridge = bridge::start(browser::launch(&config.browser)?).await?;
-    // Only this user can read the folder (it's created 0700).
+    // Only this user can read the folder (it's created 0700). Chrome DevTools
+    // MCP reads the file once on start, so it's removed as soon as the
+    // browser answers.
     let private = tempfile::Builder::new()
         .prefix("cohelm-helper-")
         .tempdir()?;
     let devtools_config = backend::write_config(private.path(), &bridge.ws_url)?;
-    let backend = match backend::connect(&config.devtools, &devtools_config).await {
+    let connected = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        backend::connect(&config.devtools, &devtools_config),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(HelperError::BrowserUnreachable(format!(
+            "no answer within {} s",
+            CONNECT_TIMEOUT.as_secs()
+        )))
+    });
+    drop(private);
+    let backend = match connected {
         Ok(backend) => Arc::new(backend),
         Err(e) => {
             bridge.close_browser().await;
@@ -137,9 +157,6 @@ pub async fn start(config: HelperConfig) -> Result<RunningHelper, HelperError> {
     let task = tokio::spawn({
         let cancel = cancel.clone();
         async move {
-            // Kept until the Helper stops: Chrome DevTools MCP may read its
-            // config again when it reconnects.
-            let _private = private;
             let server = axum::serve(listener, router)
                 .with_graceful_shutdown(cancel.clone().cancelled_owned());
             let watch = async {
