@@ -6,59 +6,25 @@
 //! fetching it with npx. Without COHELM_TEST_CHROME the test is skipped, unless
 //! COHELM_REQUIRE_BROWSER_TESTS is set, as it is in CI.
 
-use std::{
-    ffi::OsString,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::time::Duration;
 
-use cohelm_helper::{BrowserCommand, DevtoolsCommand, HelperConfig, start};
-use rmcp::{ServiceExt, model::CallToolRequestParams, transport::StreamableHttpClientTransport};
+use cohelm_helper::start;
+use rmcp::model::CallToolRequestParams;
 use serde_json::json;
 
 mod common;
-use common::{EXTENSION_PAGE, args, call, start_site};
-
-fn browser_command(chrome: PathBuf, profile: &Path, first_page: &str) -> BrowserCommand {
-    let mut browser = BrowserCommand::new(chrome, profile);
-    browser.extension_dir = Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("../extension"));
-    browser.args = [
-        "--headless=new",
-        "--no-first-run",
-        "--no-default-browser-check",
-    ]
-    .map(OsString::from)
-    .to_vec();
-    // Extra flags for the test machine only, such as --no-sandbox on CI
-    // runners that block Chromium's sandbox. Cohelm itself never adds them.
-    if let Ok(extra) = std::env::var("COHELM_TEST_CHROME_ARGS") {
-        browser
-            .args
-            .extend(extra.split_whitespace().map(OsString::from));
-    }
-    browser.args.push(first_page.into());
-    browser
-}
+use common::{
+    EXTENSION_PAGE, TEST_AGENT, args, call, connect_as, helper_config, start_site, test_chrome,
+};
 
 #[tokio::test]
 async fn agent_works_in_the_persons_open_tab_on_their_session() {
-    let Some(chrome) = std::env::var_os("COHELM_TEST_CHROME").map(PathBuf::from) else {
-        assert!(
-            std::env::var_os("COHELM_REQUIRE_BROWSER_TESTS").is_none(),
-            "COHELM_REQUIRE_BROWSER_TESTS is set but COHELM_TEST_CHROME is not"
-        );
-        eprintln!("skipped: set COHELM_TEST_CHROME to a Chromium executable");
+    let Some(chrome) = test_chrome() else {
         return;
     };
     let site = start_site().await;
     let profile = tempfile::tempdir().unwrap();
-    let mut config = HelperConfig::new(
-        "127.0.0.1:0".parse().unwrap(),
-        browser_command(chrome, profile.path(), &format!("{site}/sign-in")),
-    );
-    if let Some(script) = std::env::var_os("COHELM_TEST_DEVTOOLS_MCP") {
-        config.devtools = DevtoolsCommand::node_script(script);
-    }
+    let config = helper_config(chrome, profile.path(), &format!("{site}/sign-in"));
     let helper = start(config).await.expect("Helper starts");
     assert!(
         cohelm_helper::cohelm_at(helper.addr, Duration::from_secs(10)).await,
@@ -71,10 +37,9 @@ async fn agent_works_in_the_persons_open_tab_on_their_session() {
         "the browser opened a debugging port"
     );
 
-    let agent = ()
-        .serve(StreamableHttpClientTransport::from_uri(
-            helper.mcp_url.clone(),
-        ))
+    // Approving Agents has its own tests; this one is allowed up front.
+    helper.agents().answer(TEST_AGENT, true);
+    let agent = connect_as(TEST_AGENT, &helper.mcp_url)
         .await
         .expect("Agent connects");
 

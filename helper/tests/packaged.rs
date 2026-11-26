@@ -9,11 +9,11 @@
 
 use std::{path::PathBuf, process::Stdio, time::Duration};
 
-use rmcp::{ServiceExt, model::CallToolRequestParams, transport::StreamableHttpClientTransport};
+use rmcp::model::CallToolRequestParams;
 use serde_json::json;
 
 mod common;
-use common::{Agent, args, call, start_site, text_of};
+use common::{Agent, TEST_AGENT, args, call, connect_as, start_site, text_of};
 
 #[tokio::test]
 async fn installed_cohelm_starts_its_browser_and_serves_an_agent() {
@@ -28,6 +28,13 @@ async fn installed_cohelm_starts_its_browser_and_serves_an_agent() {
         let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         free.local_addr().unwrap()
     };
+    // The person allowed the test's Agent before, as Cohelm keeps it.
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::write(
+        profile.join("Cohelm Agents.json"),
+        json!({ "allowed": [TEST_AGENT] }).to_string(),
+    )
+    .unwrap();
 
     let mut helper = cohelm(&helper_exe, &profile, addr, &format!("{site}/sign-in"))
         .spawn()
@@ -179,7 +186,7 @@ async fn connect(url: &str, helper: &mut tokio::process::Child) -> Agent {
         if let Some(status) = helper.try_wait().unwrap() {
             panic!("the Helper exited early: {status}");
         }
-        if let Ok(agent) = ().serve(StreamableHttpClientTransport::from_uri(url.to_owned())).await {
+        if let Ok(agent) = connect_as(TEST_AGENT, url).await {
             return agent;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;

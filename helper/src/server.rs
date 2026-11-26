@@ -13,10 +13,14 @@ use rmcp::{
 };
 use std::time::Duration;
 
+use axum::response::IntoResponse;
+use rmcp::transport::streamable_http_server::session::SessionManager;
+
 use tokio::task::JoinHandle;
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::{
+    agents::{Agents, SessionId},
     backend::{self, Backend},
     bridge, browser,
     config::{HelperConfig, HelperError},
@@ -26,10 +30,15 @@ use crate::{
 /// finds its port taken.
 pub const SERVER_NAME: &str = "cohelm";
 
+/// How often the Helper checks which Agents' sessions have ended.
+const PRUNE_EVERY: Duration = Duration::from_secs(2);
+
 /// Serves Agents and passes their tool calls to the person's browser.
 #[derive(Clone)]
 struct Helper {
     backend: Arc<Backend>,
+    agents: Arc<Agents>,
+    approval_wait: Duration,
 }
 
 impl ServerHandler for Helper {
@@ -52,8 +61,19 @@ impl ServerHandler for Helper {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        // Nothing reaches a tab until the person has allowed this Agent.
+        let name = context.client_info().map(|c| c.name).unwrap_or_default();
+        let session: Option<SessionId> = context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.headers.get("mcp-session-id"))
+            .and_then(|id| id.to_str().ok())
+            .map(Into::into);
+        if let Err(refusal) = self.agents.admit(&name, session, self.approval_wait).await {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(refusal.to_string())]).into());
+        }
         if let Some(reason) = refused(&request) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(reason)]).into());
         }
@@ -66,6 +86,19 @@ impl ServerHandler for Helper {
 
 /// Steps the Helper never passes to the browser, whatever the Agent asks.
 fn refused(request: &CallToolRequestParams) -> Option<&'static str> {
+    // Cohelm's own pages, where the person answers Cohelm, and the
+    // browser's settings are the person's alone.
+    let opens_own_page = request
+        .arguments
+        .as_ref()
+        .and_then(|args| args.get("url"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(browser_own_page);
+    if opens_own_page {
+        return Some(
+            "Cohelm's own pages and the browser's settings are for the person, not Agents.",
+        );
+    }
     let changes_identity = request.name == "emulate"
         && request
             .arguments
@@ -75,6 +108,21 @@ fn refused(request: &CallToolRequestParams) -> Option<&'static str> {
         "Cohelm keeps the browser's own user agent, so sites see plain Chrome. \
          Run emulate without userAgent.",
     )
+}
+
+/// Pages an Agent may not open: the browser's own and its extensions'.
+fn browser_own_page(url: &str) -> bool {
+    let url = url.trim_start().to_ascii_lowercase();
+    [
+        "chrome:",
+        "chrome-extension:",
+        "chrome-untrusted:",
+        "devtools:",
+        "about:",
+    ]
+    .iter()
+    .any(|scheme| url.starts_with(scheme))
+        && url != "about:blank"
 }
 
 /// A running Helper. Calling [`RunningHelper::stop`] closes the browser and
@@ -88,10 +136,50 @@ pub struct RunningHelper {
     cancel: CancellationToken,
     task: JoinHandle<Result<(), HelperError>>,
     browser: bridge::Asker,
+    control: Control,
     _stop_on_drop: DropGuard,
 }
 
+/// What the person can do about Agents, from Cohelm's pages or a test.
+#[derive(Clone)]
+pub(crate) struct Control {
+    pub agents: Arc<Agents>,
+    sessions: Arc<LocalSessionManager>,
+}
+
+impl Control {
+    /// End an Agent's sessions at once and forget its approval.
+    pub async fn disconnect(&self, name: &str) {
+        for session in self.agents.disconnect(name) {
+            let _ = self.sessions.close_session(&session).await;
+        }
+    }
+
+    /// Keep the connected list to sessions that are still open.
+    async fn prune(&self) {
+        let mut live = std::collections::HashSet::new();
+        for session in self.agents.sessions() {
+            if self.sessions.has_session(&session).await.unwrap_or(false) {
+                live.insert(session);
+            }
+        }
+        self.agents.prune(|s| live.contains(s));
+    }
+}
+
 impl RunningHelper {
+    /// The Agents the person has allowed, declined or is asked about. The
+    /// person answers in Cohelm's prompt; tests answer here.
+    pub fn agents(&self) -> &Agents {
+        &self.control.agents
+    }
+
+    /// End an Agent's sessions at once and forget its approval, as the
+    /// person does from Cohelm's Agents list.
+    pub async fn disconnect(&self, name: &str) {
+        self.control.disconnect(name).await;
+    }
+
     /// Whether Cohelm's built-in extension is running in the browser.
     pub async fn extension_running(&self) -> Result<bool, HelperError> {
         self.probe().extension_running().await
@@ -242,24 +330,48 @@ pub async fn start(config: HelperConfig) -> Result<RunningHelper, HelperError> {
 
     let browser = bridge.asker();
     let cancel = CancellationToken::new();
+    let control = Control {
+        agents: Agents::load(config.agents_file.clone()),
+        sessions: Arc::new(LocalSessionManager::default()),
+    };
     let helper = Helper {
         backend: backend.clone(),
+        agents: control.agents.clone(),
+        approval_wait: config.approval_wait,
     };
     let service: StreamableHttpService<Helper, LocalSessionManager> = StreamableHttpService::new(
         move || Ok(helper.clone()),
-        Default::default(),
+        control.sessions.clone(),
         StreamableHttpServerConfig::default()
             // Host is checked against loopback by default; also refuse any
             // request a web page sends, since Agents don't send an Origin.
             .enforce_origin_validation()
             .with_cancellation_token(cancel.child_token()),
     );
-    let router = axum::Router::new().nest_service("/mcp", service);
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(only_this_computer));
+    tokio::spawn({
+        let control = control.clone();
+        let cancel = cancel.clone();
+        async move {
+            while cancel
+                .run_until_cancelled(tokio::time::sleep(PRUNE_EVERY))
+                .await
+                .is_some()
+            {
+                control.prune().await;
+            }
+        }
+    });
     let task = tokio::spawn({
         let cancel = cancel.clone();
         async move {
-            let server = axum::serve(listener, router)
-                .with_graceful_shutdown(cancel.clone().cancelled_owned());
+            let server = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(cancel.clone().cancelled_owned());
             let watch = async {
                 loop {
                     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -291,5 +403,41 @@ pub async fn start(config: HelperConfig) -> Result<RunningHelper, HelperError> {
         cancel,
         task,
         browser,
+        control,
     })
+}
+
+/// Refuse a connection from another machine. The Helper listens on loopback
+/// only, so this holds even if that ever changed by mistake.
+async fn only_this_computer(
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !peer.ip().is_loopback() {
+        tracing::warn!("refused a connection from {}", peer.ip());
+        return axum::http::StatusCode::FORBIDDEN.into_response();
+    }
+    next.run(request).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agents_cant_open_the_browsers_own_pages() {
+        for url in [
+            "chrome://settings",
+            " CHROME-EXTENSION://dojelhkgldmdbffaafmofoilmbbacppo/about.html",
+            "chrome-untrusted://print",
+            "devtools://devtools/bundled/inspector.html",
+            "about:settings",
+        ] {
+            assert!(browser_own_page(url), "{url}");
+        }
+        for url in ["https://example.com", "about:blank", "http://chrome.example"] {
+            assert!(!browser_own_page(url), "{url}");
+        }
+    }
 }

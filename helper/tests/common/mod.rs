@@ -8,14 +8,86 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
-use rmcp::model::{CallToolRequestParams, CallToolResult};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
+
+use cohelm_helper::{BrowserCommand, DevtoolsCommand, HelperConfig};
+use rmcp::{
+    ServiceExt,
+    model::{
+        CallToolRequestParams, CallToolResult, ClientCapabilities, ClientConfig, Implementation,
+    },
+    transport::StreamableHttpClientTransport,
+};
 use serde_json::{Map, Value};
 
 /// A page of Cohelm's built-in extension. Its ID comes from the key in
 /// extension/manifest.json.
 pub const EXTENSION_PAGE: &str = "chrome-extension://dojelhkgldmdbffaafmofoilmbbacppo/about.html";
 
-pub type Agent = rmcp::service::RunningService<rmcp::RoleClient, ()>;
+pub type Agent = rmcp::service::RunningService<rmcp::RoleClient, ClientConfig>;
+
+/// The name the tests' Agent gives itself.
+pub const TEST_AGENT: &str = "cohelm-test-agent";
+
+/// Connect to the Helper as an MCP client called `name`.
+pub async fn connect_as(
+    name: &str,
+    url: &str,
+) -> Result<Agent, rmcp::service::ClientInitializeError> {
+    ClientConfig::new(
+        ClientCapabilities::default(),
+        Implementation::new(name, "1.0"),
+    )
+    .serve(StreamableHttpClientTransport::from_uri(url.to_owned()))
+    .await
+}
+
+/// The Chromium the browser tests run, from COHELM_TEST_CHROME. None skips
+/// the test, unless COHELM_REQUIRE_BROWSER_TESTS is set, as it is in CI.
+pub fn test_chrome() -> Option<PathBuf> {
+    let chrome = std::env::var_os("COHELM_TEST_CHROME").map(PathBuf::from);
+    if chrome.is_none() {
+        assert!(
+            std::env::var_os("COHELM_REQUIRE_BROWSER_TESTS").is_none(),
+            "COHELM_REQUIRE_BROWSER_TESTS is set but COHELM_TEST_CHROME is not"
+        );
+        eprintln!("skipped: set COHELM_TEST_CHROME to a Chromium executable");
+    }
+    chrome
+}
+
+/// The Helper as the browser tests start it: on a free port, with the
+/// built-in extension, headless, open on `first_page`.
+pub fn helper_config(chrome: PathBuf, profile: &Path, first_page: &str) -> HelperConfig {
+    let mut config = HelperConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        browser_command(chrome, profile, first_page),
+    );
+    if let Some(script) = std::env::var_os("COHELM_TEST_DEVTOOLS_MCP") {
+        config.devtools = DevtoolsCommand::node_script(script);
+    }
+    config
+}
+
+fn browser_command(chrome: PathBuf, profile: &Path, first_page: &str) -> BrowserCommand {
+    let mut browser = BrowserCommand::new(chrome, profile);
+    browser.extension_dir = Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("../extension"));
+    browser.args = ["--headless=new", "--no-default-browser-check"]
+        .map(OsString::from)
+        .to_vec();
+    // Extra flags for the test machine only, such as --no-sandbox on CI
+    // runners that block Chromium's sandbox. Cohelm itself never adds them.
+    if let Ok(extra) = std::env::var("COHELM_TEST_CHROME_ARGS") {
+        browser
+            .args
+            .extend(extra.split_whitespace().map(OsString::from));
+    }
+    browser.args.push(first_page.into());
+    browser
+}
 
 async fn sign_in() -> impl IntoResponse {
     (

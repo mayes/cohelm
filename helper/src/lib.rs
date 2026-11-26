@@ -2,6 +2,7 @@
 //! pipe, and serves MCP to Agents on this computer so they can work in the
 //! person's own tabs through Chrome DevTools MCP.
 
+mod agents;
 mod backend;
 mod bridge;
 mod browser;
@@ -12,6 +13,8 @@ mod server;
 /// Cohelm's built-in extension, fixed by the key in `extension/manifest.json`.
 pub const EXTENSION_ID: &str = "dojelhkgldmdbffaafmofoilmbbacppo";
 
+pub use agents::Agents;
+pub use agents::{Refusal, Snapshot};
 pub use backend::DevtoolsCommand;
 pub use browser::BrowserCommand;
 pub use config::{HelperConfig, HelperError};

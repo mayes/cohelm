@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use crate::{backend::DevtoolsCommand, browser::BrowserCommand};
 
@@ -12,6 +12,11 @@ pub struct HelperConfig {
     pub browser: BrowserCommand,
     /// How to start Chrome DevTools MCP.
     pub devtools: DevtoolsCommand,
+    /// Where the Agents the person allowed are kept. By default a file in
+    /// the browser profile, so they go with it.
+    pub agents_file: Option<PathBuf>,
+    /// How long a new Agent's call is held while the person decides.
+    pub approval_wait: Duration,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -42,8 +47,10 @@ impl HelperConfig {
     pub fn new(listen: SocketAddr, browser: BrowserCommand) -> Self {
         Self {
             listen,
+            agents_file: Some(browser.profile_dir.join("Cohelm Agents.json")),
             browser,
             devtools: DevtoolsCommand::default(),
+            approval_wait: Duration::from_secs(60),
         }
     }
 
