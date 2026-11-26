@@ -17,7 +17,7 @@ An action that sends, pays, submits or deletes, and so pauses for the person's O
 _Avoid_: dangerous action, sensitive action
 
 **Helper**:
-Cohelm's Rust process that runs beside the **Base browser** and connects **Agents** to it, holding the **Pause** and the injection guard.
+Cohelm's Rust process that starts the **Base browser** over a private DevTools pipe and connects **Agents** to it, holding the **Pause** and the injection guard.
 _Avoid_: daemon, sidecar, backend
 
 **Side panel**:

@@ -1,4 +1,4 @@
-use std::ffi::OsString;
+use std::{ffi::OsString, path::Path};
 
 use rmcp::{
     RoleClient, ServiceExt,
@@ -12,10 +12,10 @@ use crate::config::HelperError;
 /// The pinned Chrome DevTools MCP release the Helper is built on.
 pub const DEVTOOLS_MCP_VERSION: &str = "1.14.0";
 
-/// How to start Chrome DevTools MCP. The Helper always adds the flags that
-/// attach it to the person's running browser and switch off Google's usage
+/// How to start Chrome DevTools MCP. The Helper always adds the config file
+/// that points it at the browser, the flags that switch off Google's usage
 /// statistics and CrUX lookups, and the environment that stops its daily
-/// update check and its loading of a user config file.
+/// update check and its search for a user config file.
 #[derive(Debug, Clone)]
 pub struct DevtoolsCommand {
     pub program: OsString,
@@ -43,17 +43,11 @@ impl DevtoolsCommand {
         }
     }
 
-    pub(crate) fn args_for(&self, browser_url: &str) -> Vec<OsString> {
+    pub(crate) fn args_for(&self, config_file: &Path) -> Vec<OsString> {
         let mut args = self.args.clone();
-        args.extend(
-            [
-                "--browserUrl",
-                browser_url,
-                "--no-usage-statistics",
-                "--no-performance-crux",
-            ]
-            .map(OsString::from),
-        );
+        args.push("--config".into());
+        args.push(config_file.into());
+        args.extend(["--no-usage-statistics", "--no-performance-crux"].map(OsString::from));
         args
     }
 }
@@ -68,13 +62,23 @@ pub(crate) const DEVTOOLS_ENV: [(&str, &str); 3] = [
     ("CHROME_DEVTOOLS_MCP_NO_CONFIG_DISCOVERY", "1"),
 ];
 
-/// Start Chrome DevTools MCP attached to the running browser, and check that
-/// the browser answers before any Agent is told the Helper is ready.
+/// Write the config file that points Chrome DevTools MCP at the bridge. It
+/// holds the bridge's secret, so it goes in a folder only this user can read
+/// rather than on a command line other programs can see.
+pub(crate) fn write_config(dir: &Path, ws_url: &str) -> Result<std::path::PathBuf, HelperError> {
+    let path = dir.join("chrome-devtools-mcp.json");
+    let config = serde_json::json!({ "wsEndpoint": ws_url });
+    std::fs::write(&path, config.to_string())?;
+    Ok(path)
+}
+
+/// Start Chrome DevTools MCP on the browser, and check that the browser
+/// answers before any Agent is told the Helper is ready.
 pub(crate) async fn connect(
     command: &DevtoolsCommand,
-    browser_url: &str,
+    config_file: &Path,
 ) -> Result<Backend, HelperError> {
-    let args = command.args_for(browser_url);
+    let args = command.args_for(config_file);
     // Resolves npx.cmd and the like on Windows.
     let program = which_command(&command.program).map_err(|e| {
         HelperError::Devtools(format!(
@@ -90,7 +94,7 @@ pub(crate) async fn connect(
     let probe = backend
         .call_tool(CallToolRequestParams::new("list_pages"))
         .await
-        .map_err(|e| HelperError::BrowserUnreachable(browser_url.to_owned(), e.to_string()))?;
+        .map_err(|e| HelperError::BrowserUnreachable(e.to_string()))?;
     if probe.is_error == Some(true) {
         let detail = probe
             .content
@@ -98,10 +102,7 @@ pub(crate) async fn connect(
             .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
             .collect::<Vec<_>>()
             .join(" ");
-        return Err(HelperError::BrowserUnreachable(
-            browser_url.to_owned(),
-            detail,
-        ));
+        return Err(HelperError::BrowserUnreachable(detail));
     }
     Ok(backend)
 }
@@ -112,12 +113,8 @@ mod tests {
 
     #[test]
     fn devtools_is_always_told_to_stay_private() {
-        let args = DevtoolsCommand::default().args_for("http://127.0.0.1:9222");
-        for flag in [
-            "--no-usage-statistics",
-            "--no-performance-crux",
-            "--browserUrl",
-        ] {
+        let args = DevtoolsCommand::default().args_for(Path::new("/run/cohelm/cdm.json"));
+        for flag in ["--no-usage-statistics", "--no-performance-crux", "--config"] {
             assert!(args.iter().any(|a| a == flag), "missing {flag}");
         }
         for key in [
@@ -127,6 +124,18 @@ mod tests {
         ] {
             assert!(DEVTOOLS_ENV.iter().any(|(k, _)| *k == key), "missing {key}");
         }
+    }
+
+    #[test]
+    fn the_secret_stays_off_the_command_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "ws://127.0.0.1:5000/devtools/browser/s3cret";
+        let file = write_config(dir.path(), url).unwrap();
+        let args = DevtoolsCommand::default().args_for(&file);
+        assert!(!args.iter().any(|a| a.to_string_lossy().contains("s3cret")));
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+        assert_eq!(written["wsEndpoint"], url);
     }
 
     #[test]

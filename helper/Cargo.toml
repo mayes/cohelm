@@ -5,15 +5,24 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.105"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
+getrandom = "0.3"
 rmcp = { version = "3.12", features = ["server", "client", "transport-child-process", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "macros", "which-command"] }
 serde_json = "1.0.154"
+tempfile = "3.27.0"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-util = "0.7.20"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
-url = "2.5.9"
 
 [dev-dependencies]
+futures = "0.3"
 tempfile = "3.27.0"
+tokio-tungstenite = "0.29"
+
+[target."cfg(unix)".dependencies]
+libc = "0.2"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation"] }

@@ -18,6 +18,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::{
     backend::{self, Backend},
+    bridge, browser,
     config::{HelperConfig, HelperError},
 };
 
@@ -71,8 +72,8 @@ fn refused(request: &CallToolRequestParams) -> Option<&'static str> {
     )
 }
 
-/// A running Helper. Dropping it, or calling [`RunningHelper::stop`], shuts
-/// it down and stops Chrome DevTools MCP.
+/// A running Helper. Calling [`RunningHelper::stop`] closes the browser and
+/// shuts the Helper down; dropping it stops both straight away.
 pub struct RunningHelper {
     /// Where Agents connect, for example `http://127.0.0.1:47600/mcp`.
     pub mcp_url: String,
@@ -89,8 +90,8 @@ impl RunningHelper {
         let _ = self.task.await;
     }
 
-    /// Wait until the Helper stops on its own, for example because Chrome
-    /// DevTools MCP exited.
+    /// Wait until the Helper stops on its own: the person quit the browser,
+    /// or Chrome DevTools MCP exited.
     pub async fn stopped(&mut self) -> Result<(), HelperError> {
         match (&mut self.task).await {
             Ok(result) => result,
@@ -99,13 +100,25 @@ impl RunningHelper {
     }
 }
 
-/// Attach to the browser and start serving Agents.
+/// Start the browser, attach to it and start serving Agents.
 pub async fn start(config: HelperConfig) -> Result<RunningHelper, HelperError> {
     config.validate()?;
     // Take the port first, so a busy port fails before anything starts.
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;
-    let backend = Arc::new(backend::connect(&config.devtools, &config.browser_url).await?);
+    let mut bridge = bridge::start(browser::launch(&config.browser)?).await?;
+    // Only this user can read the folder (it's created 0700).
+    let private = tempfile::Builder::new()
+        .prefix("cohelm-helper-")
+        .tempdir()?;
+    let devtools_config = backend::write_config(private.path(), &bridge.ws_url)?;
+    let backend = match backend::connect(&config.devtools, &devtools_config).await {
+        Ok(backend) => Arc::new(backend),
+        Err(e) => {
+            bridge.close_browser().await;
+            return Err(e);
+        }
+    };
 
     let cancel = CancellationToken::new();
     let helper = Helper {
@@ -124,6 +137,9 @@ pub async fn start(config: HelperConfig) -> Result<RunningHelper, HelperError> {
     let task = tokio::spawn({
         let cancel = cancel.clone();
         async move {
+            // Kept until the Helper stops: Chrome DevTools MCP may read its
+            // config again when it reconnects.
+            let _private = private;
             let server = axum::serve(listener, router)
                 .with_graceful_shutdown(cancel.clone().cancelled_owned());
             let watch = async {
@@ -134,14 +150,20 @@ pub async fn start(config: HelperConfig) -> Result<RunningHelper, HelperError> {
                     }
                 }
             };
-            tokio::select! {
+            let result = tokio::select! {
                 served = server => served.map_err(HelperError::from),
                 () = watch => {
                     tracing::error!("Chrome DevTools MCP exited; stopping the Helper");
-                    cancel.cancel();
                     Err(HelperError::DevtoolsClosed)
                 }
-            }
+                () = bridge.browser_exited() => {
+                    tracing::info!("the browser closed; stopping the Helper");
+                    Err(HelperError::BrowserClosed)
+                }
+            };
+            cancel.cancel();
+            bridge.close_browser().await;
+            result
         }
     });
     Ok(RunningHelper {

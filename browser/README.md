@@ -10,7 +10,7 @@ Full builds take hours and run on the project's self-hosted build machines (ADR 
 | --- | --- | --- |
 | Patches | [`patches/series`](patches/series) | Cohelm's own Chromium patches, applied after ungoogled-chromium's. Empty for now, on purpose. |
 | GN flags | [`flags.gn`](flags.gn) | Repeats the privacy flags Cohelm relies on, after the platform repo's flags. |
-| Packaging | coming in this ticket | Names the app Cohelm, keeps its own profile folder, starts the Helper and loads the built-in extension. |
+| Packaging | coming in this ticket | Names the app Cohelm and starts the Helper, which starts Chromium in Cohelm's own profile folder over a private DevTools pipe (ADR 0005) and loads the built-in extension. |
 
 The patch set stays small so each Chromium update is a quick rebase. Anything packaging can do, packaging does. A patch is added only when there's no other way, it makes one change, and its header says why it exists.
 
