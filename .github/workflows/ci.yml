@@ -33,33 +33,39 @@ jobs:
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
-      # Temporary: tells whether Chrome's child processes start on this Mac
-      # runner when launched from a shell, with a port and with the pipe.
+      # Temporary: the Mac runner's setup-chrome build can't start its child
+      # processes (MachPortRendezvous "Permission denied"), in port and pipe
+      # mode alike. Try Chrome for Testing, the build Puppeteer uses.
+      - id: cft
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          out=$(npx -y @puppeteer/browsers@2 install chrome@stable --path "$RUNNER_TEMP/cft")
+          echo "$out"
+          echo "path=${out##* }" >> "$GITHUB_OUTPUT"
       - name: Mac Chrome launch check (temporary)
         if: runner.os == 'macOS'
         continue-on-error: true
         shell: bash
         env:
-          CHROME: ${{ steps.chrome.outputs.chrome-path }}
+          SETUP_CHROME: ${{ steps.chrome.outputs.chrome-path }}
+          CFT_CHROME: ${{ steps.cft.outputs.path }}
         run: |
-          for mode in port pipe; do
+          for name in SETUP_CHROME CFT_CHROME; do
+            chrome=${!name}
             dir=$(mktemp -d)
-            if [ "$mode" = port ]; then
-              "$CHROME" --headless=new --no-first-run --user-data-dir="$dir" --remote-debugging-port=0 about:blank 2>"$dir/err" &
-            else
-              "$CHROME" --headless=new --no-first-run --user-data-dir="$dir" --remote-debugging-pipe about:blank 3</dev/null 4>/dev/null 2>"$dir/err" &
-            fi
+            "$chrome" --headless=new --no-first-run --user-data-dir="$dir" --remote-debugging-pipe about:blank 3</dev/null 4>/dev/null 2>"$dir/err" &
             pid=$!
             sleep 10
             kill "$pid" 2>/dev/null || true
-            echo "== $mode: rendezvous errors: $(grep -c MachPortRendezvous "$dir/err" || true)"
-            grep -m3 -E "Rendezvous|crashed" "$dir/err" || true
+            echo "== $name: rendezvous errors: $(grep -c MachPortRendezvous "$dir/err" || true), crashes: $(grep -c crashed "$dir/err" || true)"
+            codesign -dv "$(dirname "$(dirname "$(dirname "$chrome")")")" 2>&1 | grep -E "Identifier|TeamIdentifier|Signature" || true
           done
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
         env:
-          COHELM_TEST_CHROME: ${{ steps.chrome.outputs.chrome-path }}
+          COHELM_TEST_CHROME: ${{ steps.cft.outputs.path || steps.chrome.outputs.chrome-path }}
           # Linux runners block Chromium's sandbox.
           COHELM_TEST_CHROME_ARGS: ${{ runner.os == 'Linux' && '--no-sandbox' || '' }}
           COHELM_REQUIRE_BROWSER_TESTS: "1"
