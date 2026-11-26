@@ -60,6 +60,10 @@ async fn agent_works_in_the_persons_open_tab_on_their_session() {
         config.devtools = DevtoolsCommand::node_script(script);
     }
     let helper = start(config).await.expect("Helper starts");
+    assert!(
+        cohelm_helper::cohelm_at(helper.addr, Duration::from_secs(10)).await,
+        "the Helper names itself to Agents"
+    );
     // The browser is driven over the Helper's private pipe only: it opened
     // no debugging port.
     assert!(

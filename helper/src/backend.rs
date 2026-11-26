@@ -9,6 +9,9 @@ use rmcp::{
 
 use crate::config::HelperError;
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// The pinned Chrome DevTools MCP release the Helper is built on.
 pub const DEVTOOLS_MCP_VERSION: &str = "1.14.0";
 
@@ -88,6 +91,11 @@ pub(crate) async fn connect(
     })?;
     let transport = TokioChildProcess::new(program.configure(|cmd| {
         cmd.args(&args).envs(DEVTOOLS_ENV).kill_on_drop(true);
+        // Node is a console program: without this an installed Cohelm,
+        // which has no console, would open a window for it, and closing
+        // that window would stop Chrome DevTools MCP.
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
     }))?;
     let backend = ().serve(transport).await.map_err(|e| HelperError::Devtools(e.to_string()))?;
 

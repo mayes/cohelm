@@ -308,6 +308,8 @@ impl Relay {
                     self.send_own("Browser.close", json!({}), None).await;
                 }
                 Event::Ask(method, params, answer) => {
+                    // Forget commands whose asker gave up waiting.
+                    self.asked.retain(|_, waiting| !waiting.is_closed());
                     let id = self.send_own(&method, params, None).await;
                     self.asked.insert(id, answer);
                 }

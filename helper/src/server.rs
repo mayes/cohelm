@@ -1,10 +1,10 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use rmcp::{
-    ErrorData as McpError, ServerHandler,
+    ErrorData as McpError, ServerHandler, ServiceExt,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
-        PaginatedRequestParams, ServerCapabilities, ServerConfig,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig,
     },
     service::{RequestContext, RoleServer},
     transport::streamable_http_server::{
@@ -22,6 +22,10 @@ use crate::{
     config::{HelperConfig, HelperError},
 };
 
+/// The name the Helper gives Agents, and checks for when a second Cohelm
+/// finds its port taken.
+pub const SERVER_NAME: &str = "cohelm";
+
 /// Serves Agents and passes their tool calls to the person's browser.
 #[derive(Clone)]
 struct Helper {
@@ -31,6 +35,7 @@ struct Helper {
 impl ServerHandler for Helper {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(SERVER_NAME, env!("CARGO_PKG_VERSION")))
     }
 
     async fn list_tools(
@@ -89,17 +94,14 @@ pub struct RunningHelper {
 impl RunningHelper {
     /// Whether Cohelm's built-in extension is running in the browser.
     pub async fn extension_running(&self) -> Result<bool, HelperError> {
-        let targets = self
-            .browser
-            .ask("Target.getTargets", serde_json::json!({}))
-            .await?;
-        let page = format!("chrome-extension://{}/", crate::EXTENSION_ID);
-        Ok(targets["targetInfos"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|t| t["url"].as_str())
-            .any(|url| url.starts_with(&page)))
+        self.probe().extension_running().await
+    }
+
+    /// A handle for asking about the browser while the Helper runs.
+    pub fn probe(&self) -> BrowserProbe {
+        BrowserProbe {
+            browser: self.browser.clone(),
+        }
     }
 
     /// Shut the Helper down and wait for it to finish.
@@ -114,6 +116,60 @@ impl RunningHelper {
         match (&mut self.task).await {
             Ok(result) => result,
             Err(e) => Err(HelperError::Devtools(e.to_string())),
+        }
+    }
+}
+
+/// Asks the browser about itself, apart from any Agent.
+#[derive(Clone)]
+pub struct BrowserProbe {
+    browser: bridge::Asker,
+}
+
+impl BrowserProbe {
+    /// Whether Cohelm's built-in extension is running in the browser.
+    pub async fn extension_running(&self) -> Result<bool, HelperError> {
+        let targets = self
+            .browser
+            .ask("Target.getTargets", serde_json::json!({}))
+            .await?;
+        let page = format!("chrome-extension://{}/", crate::EXTENSION_ID);
+        Ok(targets["targetInfos"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t["url"].as_str())
+            .any(|url| url.starts_with(&page)))
+    }
+}
+
+/// Whether a Cohelm Helper is serving Agents at `addr`, waiting up to `wait`
+/// for one that is still starting. Used when a second Cohelm finds the port
+/// taken, so it never hands pages to some other program.
+pub async fn cohelm_at(addr: SocketAddr, wait: Duration) -> bool {
+    let url = format!("http://{addr}/mcp");
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let attempt = tokio::time::timeout_at(
+            deadline,
+            ().serve(rmcp::transport::StreamableHttpClientTransport::from_uri(
+                url.clone(),
+            )),
+        )
+        .await;
+        match attempt {
+            Ok(Ok(client)) => {
+                let named = client
+                    .peer_info()
+                    .and_then(|info| info.server_info.as_ref().map(|s| s.name == SERVER_NAME))
+                    .unwrap_or(false);
+                let _ = client.cancel().await;
+                return named;
+            }
+            Ok(Err(_)) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            _ => return false,
         }
     }
 }

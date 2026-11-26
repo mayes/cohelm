@@ -9,11 +9,11 @@
 
 use std::{path::PathBuf, process::Stdio, time::Duration};
 
-use rmcp::{ServiceExt, transport::StreamableHttpClientTransport};
+use rmcp::{ServiceExt, model::CallToolRequestParams, transport::StreamableHttpClientTransport};
 use serde_json::json;
 
 mod common;
-use common::{Agent, call, start_site};
+use common::{Agent, args, call, start_site, text_of};
 
 #[tokio::test]
 async fn installed_cohelm_starts_its_browser_and_serves_an_agent() {
@@ -29,22 +29,20 @@ async fn installed_cohelm_starts_its_browser_and_serves_an_agent() {
         free.local_addr().unwrap()
     };
 
-    let mut helper = tokio::process::Command::new(&helper_exe)
-        .arg(format!("{site}/sign-in"))
-        .env("COHELM_PROFILE_DIR", &profile)
-        .env("COHELM_HELPER_ADDR", addr.to_string())
-        .env_remove("COHELM_BROWSER")
-        .env_remove("COHELM_EXTENSION_DIR")
-        .env_remove("COHELM_DEVTOOLS_MCP")
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
+    let mut helper = cohelm(&helper_exe, &profile, addr, &format!("{site}/sign-in"))
         .spawn()
         .expect("the installed Helper starts");
 
     let agent = connect(&format!("http://{addr}/mcp"), &mut helper).await;
     let mut pages = String::new();
+    let mut last = None;
     for _ in 0..100 {
-        pages = call(&agent, "list_pages", json!({})).await;
+        let result = agent
+            .call_tool(CallToolRequestParams::new("list_pages").with_arguments(args(json!({}))))
+            .await
+            .expect("list_pages");
+        pages = text_of(&result);
+        last = Some(result);
         if pages.contains("/sign-in") {
             break;
         }
@@ -52,7 +50,8 @@ async fn installed_cohelm_starts_its_browser_and_serves_an_agent() {
     }
     assert!(
         pages.contains("/sign-in"),
-        "the person's tab is listed:\n{pages}"
+        "the person's tab is listed:\n{last:#?}\nHelper log:\n{}",
+        log_of(home.path())
     );
     let page_id: u64 = pages
         .lines()
@@ -84,10 +83,9 @@ async fn installed_cohelm_starts_its_browser_and_serves_an_agent() {
     );
 
     // The installed Helper logs beside the profile.
-    let log = home.path().join("Helper.log");
     let mut logged = String::new();
     for _ in 0..150 {
-        logged = std::fs::read_to_string(&log).unwrap_or_default();
+        logged = log_of(home.path());
         if logged.contains("built-in extension") {
             break;
         }
@@ -98,8 +96,81 @@ async fn installed_cohelm_starts_its_browser_and_serves_an_agent() {
         "the built-in extension is running:\n{logged}"
     );
 
+    // Starting Cohelm again, as opening a link with it would, hands the page
+    // to the running browser and starts no second Helper.
+    let second = tokio::time::timeout(
+        Duration::from_secs(90),
+        cohelm(
+            &helper_exe,
+            &profile,
+            addr,
+            &format!("{site}/account?again"),
+        )
+        .status(),
+    )
+    .await
+    .expect("a second start returns")
+    .expect("a second start runs");
+    assert!(second.success(), "a second start hands over: {second}");
+    for _ in 0..100 {
+        pages = call(&agent, "list_pages", json!({})).await;
+        if pages.contains("again") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        pages.contains("again"),
+        "the running browser opened the page:\n{pages}"
+    );
+
     agent.cancel().await.unwrap();
     quit(&mut helper).await;
+
+    // The extension comes up again on the next start with the same profile.
+    let mut helper = cohelm(&helper_exe, &profile, addr, &format!("{site}/sign-in"))
+        .spawn()
+        .expect("the installed Helper starts again");
+    let agent = connect(&format!("http://{addr}/mcp"), &mut helper).await;
+    let ready = "Cohelm's built-in extension is running";
+    for _ in 0..150 {
+        logged = log_of(home.path());
+        if logged.matches(ready).count() >= 2 || logged.contains("didn't start") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        logged.matches(ready).count(),
+        2,
+        "the built-in extension runs on every start:\n{logged}"
+    );
+    agent.cancel().await.unwrap();
+    quit(&mut helper).await;
+}
+
+/// The installed Helper, run as installed but with its own profile and port.
+fn cohelm(
+    exe: &std::path::Path,
+    profile: &std::path::Path,
+    addr: std::net::SocketAddr,
+    page: &str,
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(exe);
+    command
+        .arg(page)
+        .env("COHELM_PROFILE_DIR", profile)
+        .env("COHELM_HELPER_ADDR", addr.to_string())
+        .env_remove("COHELM_BROWSER")
+        .env_remove("COHELM_EXTENSION_DIR")
+        .env_remove("COHELM_DEVTOOLS_MCP")
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    command
+}
+
+fn log_of(home: &std::path::Path) -> String {
+    std::fs::read_to_string(home.join("Helper.log")).unwrap_or_default()
 }
 
 /// The installed Helper may take a while on its first start.

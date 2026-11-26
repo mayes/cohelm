@@ -63,3 +63,19 @@ async fn a_second_cohelm_finds_the_first_one_running() {
         Err(HelperError::AlreadyRunning(addr)) if addr == busy
     ));
 }
+
+#[tokio::test]
+async fn another_program_on_the_port_is_not_taken_for_cohelm() {
+    let other = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = other.local_addr().unwrap();
+    // Answers every connection with something that isn't MCP.
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        while let Ok((mut socket, _)) = other.accept().await {
+            let _ = socket
+                .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")
+                .await;
+        }
+    });
+    assert!(!cohelm_helper::cohelm_at(addr, std::time::Duration::from_secs(2)).await);
+}

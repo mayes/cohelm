@@ -38,9 +38,9 @@ The built-in extension is loaded with `--load-extension`. Branded Chrome removed
 ## Consequences
 
 - An installed Helper logs to `Helper.log` beside the profile folder, since it has no terminal. `COHELM_BROWSER`, `COHELM_EXTENSION_DIR`, `COHELM_DEVTOOLS_MCP` and `COHELM_PROFILE_DIR` still override each part, for development.
-- Starting Cohelm a second time while it runs hands the pages to the running browser through Chromium's own single-instance check, and no second Helper starts.
+- Starting Cohelm a second time while it runs hands the pages to the running browser through Chromium's own single-instance check, and no second Helper starts. It first checks that the program on the Helper's port is a Cohelm Helper, waiting for one that is still starting, so it never hands pages to some other program. Cohelm takes only pages on its command line: anything that looks like a browser switch is dropped.
 - The beta is unsigned (ADR 0003). The outer Mac app is signed ad hoc so its parts hold together, and the browser keeps its own signature. Gatekeeper and SmartScreen will warn until signing is set up.
-- CI packages Chrome for Testing as a stand-in for the browser build, installs it the way a person would, and runs the installed-app smoke test on Mac and Windows. Nothing it builds is uploaded. The same test runs on each real build on the build machines before release.
+- CI packages Chrome for Testing as a stand-in for the browser build, installs it the way a person would, and runs the installed-app smoke test on Mac and Windows. Nothing it builds is uploaded. The same test runs on each real build on the build machines before release. CI runs the installed program directly, so opening a downloaded disk image or installer the way a person does, past Gatekeeper and SmartScreen, is checked by hand before release.
 - Known gaps for 0.1:
   - The inner browser still names itself Chromium in the Dock, menus and taskbar. Naming it Cohelm needs ungoogled-chromium's branding settings in the build.
   - Opening Cohelm.app again on a Mac while it runs does nothing visible, because the background Helper is already running. Clicking the browser in the Dock brings it forward.
