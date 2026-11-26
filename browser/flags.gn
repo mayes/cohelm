@@ -1,0 +1,9 @@
+# GN args Cohelm adds on top of the platform repo's own flags.
+# ungoogled-chromium already turns these off; Cohelm repeats the ones its
+# privacy promise rests on, so a change upstream can't switch them back on
+# unnoticed.
+enable_reporting=false
+safe_browsing_mode=0
+enable_hangout_services_extension=false
+enable_mdns=false
+enable_remoting=false

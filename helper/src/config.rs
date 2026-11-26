@@ -1,42 +1,62 @@
-use std::net::{IpAddr, SocketAddr};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use url::Url;
-
-use crate::backend::DevtoolsCommand;
+use crate::{backend::DevtoolsCommand, browser::BrowserCommand, updates::UpdateCheck};
 
 /// How the Helper is started.
 #[derive(Debug, Clone)]
 pub struct HelperConfig {
     /// Where Agents connect. Must be a loopback address.
     pub listen: SocketAddr,
-    /// The DevTools address of the person's running Cohelm browser.
-    pub browser_url: String,
+    /// How to start the person's Cohelm browser, which the Helper drives
+    /// over a private pipe.
+    pub browser: BrowserCommand,
     /// How to start Chrome DevTools MCP.
     pub devtools: DevtoolsCommand,
+    /// Where the Agents the person allowed are kept. By default a file in
+    /// the browser profile, so they go with it.
+    pub agents_file: Option<PathBuf>,
+    /// How long a new Agent's call is held while the person decides.
+    pub approval_wait: Duration,
+    /// How long a Pause waits for the person before it counts as blocked.
+    pub pause_wait: Duration,
+    /// How the Helper looks for a newer Cohelm. None never looks.
+    pub updates: Option<UpdateCheck>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum HelperError {
     #[error("the Helper only listens on this computer, not on {0}")]
     NotLoopback(SocketAddr),
-    #[error("the browser must run on this computer, not at {0}")]
-    BrowserNotLocal(String),
+    #[error("the browser profile folder must be a full path, not {0}")]
+    Profile(PathBuf),
+    #[error("no extension manifest.json in {0}")]
+    Extension(PathBuf),
+    #[error("could not start the browser {0}: {1}")]
+    BrowserStart(String, String),
     #[error("could not start Chrome DevTools MCP: {0}")]
     Devtools(String),
-    #[error("can't reach the browser at {0}: {1}")]
-    BrowserUnreachable(String, String),
+    #[error("can't reach the browser: {0}")]
+    BrowserUnreachable(String),
     #[error("lost the connection to Chrome DevTools MCP")]
     DevtoolsClosed,
+    #[error("Cohelm is already running: {0} is in use")]
+    AlreadyRunning(SocketAddr),
+    #[error("the browser closed")]
+    BrowserClosed,
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
 
 impl HelperConfig {
-    pub fn new(listen: SocketAddr, browser_url: impl Into<String>) -> Self {
+    pub fn new(listen: SocketAddr, browser: BrowserCommand) -> Self {
         Self {
             listen,
-            browser_url: browser_url.into(),
+            agents_file: Some(browser.profile_dir.join("Cohelm Agents.json")),
+            browser,
             devtools: DevtoolsCommand::default(),
+            approval_wait: Duration::from_secs(60),
+            pause_wait: crate::pauses::PAUSE_WAIT,
+            updates: None,
         }
     }
 
@@ -45,23 +65,6 @@ impl HelperConfig {
         if !self.listen.ip().is_loopback() {
             return Err(HelperError::NotLoopback(self.listen));
         }
-        let local = Url::parse(&self.browser_url)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_owned))
-            .is_some_and(|host| is_local_host(&host));
-        if !local {
-            return Err(HelperError::BrowserNotLocal(self.browser_url.clone()));
-        }
-        Ok(())
+        self.browser.validate()
     }
-}
-
-fn is_local_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    host.trim_start_matches('[')
-        .trim_end_matches(']')
-        .parse::<IpAddr>()
-        .is_ok_and(|ip| ip.is_loopback())
 }

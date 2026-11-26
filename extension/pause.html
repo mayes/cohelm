@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Allow this step? · Cohelm</title>
+    <link rel="stylesheet" href="cohelm.css">
+  </head>
+  <body>
+    <main id="waiting">
+      <p class="muted">Connecting to Cohelm…</p>
+    </main>
+    <main id="prompt" hidden>
+      <p class="label" id="kind"></p>
+      <h1><span id="agent"></span> wants to <span id="action"></span></h1>
+      <p id="where" class="muted" hidden>On <strong id="site"></strong></p>
+      <pre id="detail" class="detail" hidden></pre>
+      <p id="may"></p>
+      <p class="muted">Nothing happens until you answer. If you don't, Cohelm blocks it.</p>
+      <div class="actions">
+        <button id="block">Block</button>
+        <button id="allow" class="primary">Allow</button>
+      </div>
+    </main>
+    <main id="done" hidden>
+      <p class="muted">Answered. You can close this window.</p>
+    </main>
+    <script type="module" src="pause.js"></script>
+  </body>
+</html>

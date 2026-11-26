@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Agents · Cohelm</title>
+    <link rel="stylesheet" href="cohelm.css">
+    <style>body { width: 380px; }</style>
+  </head>
+  <body>
+    <h1>Agents</h1>
+    <p id="status" class="muted">Connecting to Cohelm…</p>
+
+    <div id="update" class="notice" hidden>
+      <p><strong>Cohelm <span id="update-version"></span> is out.</strong> You're on <span id="current-version"></span>.</p>
+      <p><a id="update-download" target="_blank" rel="noopener">Download</a> · <a id="update-notes" target="_blank" rel="noopener">What's new</a></p>
+    </div>
+
+    <section id="lists" hidden>
+      <div id="asking-part" hidden>
+        <h2>Asking</h2>
+        <div id="asking"></div>
+        <p class="muted">Answer in the window Cohelm opened for each.</p>
+      </div>
+      <h2>Allowed</h2>
+      <div id="allowed"></div>
+      <p id="none" class="muted" hidden>No Agents yet. Connect one with the details below.</p>
+      <div id="declined-part" hidden>
+        <h2>Declined</h2>
+        <div id="declined"></div>
+      </div>
+    </section>
+
+    <section id="connect" hidden>
+      <h2>Connect an Agent</h2>
+      <p class="label">Address, for any MCP client</p>
+      <div class="copy"><code id="url"></code><button data-copy="url">Copy</button></div>
+      <p class="label">Claude Code</p>
+      <div class="copy"><code id="claudeCode"></code><button data-copy="claudeCode">Copy</button></div>
+      <p class="label">MCP client config</p>
+      <div class="copy"><code id="json"></code><button data-copy="json">Copy</button></div>
+      <p class="muted">Only apps on this computer can connect. Cohelm asks you the first time each one does.</p>
+    </section>
+    <script type="module" src="agents.js"></script>
+  </body>
+</html>
