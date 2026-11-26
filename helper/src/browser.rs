@@ -25,6 +25,8 @@ pub struct BrowserCommand {
     /// Cohelm's own profile folder. Chromium ignores debugging switches on
     /// the default Chrome profile, and Cohelm keeps its logins apart anyway.
     pub profile_dir: PathBuf,
+    /// Cohelm's built-in extension, loaded unpacked into every window.
+    pub extension_dir: Option<PathBuf>,
 }
 
 impl BrowserCommand {
@@ -33,12 +35,18 @@ impl BrowserCommand {
             program: program.into(),
             args: Vec::new(),
             profile_dir: profile_dir.into(),
+            extension_dir: None,
         }
     }
 
     pub(crate) fn validate(&self) -> Result<(), HelperError> {
         if !self.profile_dir.is_absolute() {
             return Err(HelperError::Profile(self.profile_dir.clone()));
+        }
+        if let Some(dir) = &self.extension_dir
+            && !dir.join("manifest.json").is_file()
+        {
+            return Err(HelperError::Extension(dir.clone()));
         }
         Ok(())
     }
@@ -48,6 +56,11 @@ impl BrowserCommand {
         let mut profile = OsString::from("--user-data-dir=");
         profile.push(&self.profile_dir);
         let mut args = vec![profile, "--remote-debugging-pipe".into()];
+        if let Some(dir) = &self.extension_dir {
+            let mut load = OsString::from("--load-extension=");
+            load.push(dir);
+            args.push(load);
+        }
         args.extend(self.args.iter().cloned());
         args
     }
@@ -192,6 +205,25 @@ mod tests {
             "no debugging port"
         );
         assert_eq!(args.last().unwrap(), "https://example.com/");
+    }
+
+    #[test]
+    fn the_built_in_extension_is_loaded() {
+        let extension = tempfile::tempdir().unwrap();
+        std::fs::write(extension.path().join("manifest.json"), "{}").unwrap();
+        let mut command = BrowserCommand::new("/opt/cohelm/chromium", "/home/ada/.cohelm/profile");
+        command.extension_dir = Some(extension.path().to_path_buf());
+        command.validate().unwrap();
+        let mut expected = OsString::from("--load-extension=");
+        expected.push(extension.path());
+        assert!(command.base_args().contains(&expected));
+    }
+
+    #[test]
+    fn a_missing_extension_is_refused() {
+        let mut command = BrowserCommand::new("/opt/cohelm/chromium", "/home/ada/.cohelm/profile");
+        command.extension_dir = Some("/nowhere/extension".into());
+        assert!(matches!(command.validate(), Err(HelperError::Extension(_))));
     }
 
     #[test]

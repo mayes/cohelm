@@ -20,6 +20,8 @@ pub enum HelperError {
     NotLoopback(SocketAddr),
     #[error("the browser profile folder must be a full path, not {0}")]
     Profile(PathBuf),
+    #[error("no extension manifest.json in {0}")]
+    Extension(PathBuf),
     #[error("could not start the browser {0}: {1}")]
     BrowserStart(String, String),
     #[error("could not start Chrome DevTools MCP: {0}")]

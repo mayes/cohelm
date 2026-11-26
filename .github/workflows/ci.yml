@@ -29,17 +29,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      # Chrome for Testing: branded Chrome dropped --load-extension, which
+      # Cohelm uses for its built-in extension, and on the Mac runner the
+      # branded build can't start its own child processes.
       - id: chrome
-        uses: browser-actions/setup-chrome@v1
-        with:
-          chrome-version: stable
-      # On the Mac runner, the Chrome that setup-chrome installs can't start
-      # its own child processes, so the Mac tests use Chrome for Testing.
-      - id: cft
-        if: runner.os == 'macOS'
         shell: bash
         run: |
-          out=$(npx -y @puppeteer/browsers@2 install chrome@stable --path "$RUNNER_TEMP/cft")
+          deps=$([ "$RUNNER_OS" = Linux ] && echo --install-deps || true)
+          out=$(npx -y @puppeteer/browsers@2 install chrome@stable --path "$RUNNER_TEMP/cft" $deps)
           echo "$out"
           line=$(printf '%s\n' "$out" | tail -n 1)
           # "chrome@<version> <path>"; the path has spaces in it.
@@ -48,7 +45,7 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
         env:
-          COHELM_TEST_CHROME: ${{ steps.cft.outputs.path || steps.chrome.outputs.chrome-path }}
+          COHELM_TEST_CHROME: ${{ steps.chrome.outputs.path }}
           # Linux runners block Chromium's sandbox.
           COHELM_TEST_CHROME_ARGS: ${{ runner.os == 'Linux' && '--no-sandbox' || '' }}
           COHELM_REQUIRE_BROWSER_TESTS: "1"

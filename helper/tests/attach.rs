@@ -75,8 +75,11 @@ async fn start_site() -> String {
 
 /// The person's browser as the Helper starts it, open on a page where they
 /// sign in.
+const EXTENSION_PAGE: &str = "chrome-extension://dojelhkgldmdbffaafmofoilmbbacppo/about.html";
+
 fn browser_command(chrome: PathBuf, profile: &Path, first_page: &str) -> BrowserCommand {
     let mut browser = BrowserCommand::new(chrome, profile);
+    browser.extension_dir = Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("../extension"));
     browser.args = [
         "--headless=new",
         "--no-first-run",
@@ -233,6 +236,20 @@ async fn agent_works_in_the_persons_open_tab_on_their_session() {
     assert!(
         seen.contains(own_ua),
         "site sees the browser's own user agent {own_ua}:\n{seen}"
+    );
+
+    // Cohelm's built-in extension is loaded. Its ID comes from the key in
+    // extension/manifest.json.
+    call(
+        &agent,
+        "navigate_page",
+        json!({ "pageId": page_id, "type": "url", "url": EXTENSION_PAGE }),
+    )
+    .await;
+    let extension = call(&agent, "take_snapshot", json!({ "pageId": page_id })).await;
+    assert!(
+        extension.contains("Cohelm extension ready"),
+        "the built-in extension is loaded:\n{extension}"
     );
 
     // An Agent can't change that identity.

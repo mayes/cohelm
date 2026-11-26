@@ -565,7 +565,9 @@ mod pipe_tests {
             .headers_mut()
             .insert("origin", "https://evil.example".parse().unwrap());
         assert!(tokio_tungstenite::connect_async(from_page).await.is_err());
-        let guessed = format!("{}0", &bridge.ws_url[..bridge.ws_url.len() - 1]);
+        // Change the secret's last digit; it must differ from the real one.
+        let (head, last) = bridge.ws_url.split_at(bridge.ws_url.len() - 1);
+        let guessed = format!("{head}{}", if last == "0" { "1" } else { "0" });
         assert!(tokio_tungstenite::connect_async(guessed).await.is_err());
 
         bridge.close_browser().await;

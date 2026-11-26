@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Cohelm",
+  "description": "Cohelm's built-in prompts: Pauses, connected Agents and Background windows.",
+  "version": "0.1.0",
+  "minimum_chrome_version": "137",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0RJBlGS0DtVCHiuELilGVotx+tcZRkKcyDHy/it221ecw04GDntjqyZjj4MZhoMgnbXLDDVyNzZ2luXzae2XcBNgg8cXJ+Eh1TMqQ6YLts+BR5NE8ASQ+Q52yyJZ93Dy2FNcfwr36q36bU/ahNJvs3rTiAIe6jgyFWqOdKPiA6iTZlHpr21iq06XvVTwo5oVq4VfbQJVZT58sQwDK2ZTL1p0jP9ERHpIm2M1ZDtajnqX4HHJlwc74/nY0qd4s84mPW15AVJKNspMmTf0enlvO9cofVRfc3+IwZCpTEMMWlP/k1We8YAyUrboJcRvdssC0nEH6m1tDARWOKHWt3qJBwIDAQAB",
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Cohelm",
+    "default_popup": "about.html"
+  }
+}
