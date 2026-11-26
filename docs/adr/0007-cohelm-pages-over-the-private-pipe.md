@@ -15,6 +15,8 @@ An MCP client is known by the name it gives itself. The first time a client the 
 ## Consequences
 
 - A client's name is its own claim. Approval keeps out clients the person didn't set up. It can't keep out a program on this computer that poses as an allowed one, but such a program could read the browser profile, and so the person's sessions, without Cohelm.
-- Agents can't open the browser's own pages or Cohelm's (`chrome:`, `chrome-extension:` and the like). Chrome DevTools MCP doesn't list extension pages either, so an Agent can't press Allow for itself.
+- Agents can't open the browser's own pages or Cohelm's (`chrome:`, `chrome-extension:` and the like, read as Chromium reads an address). The bridge never attaches Chrome DevTools MCP to Cohelm's pages, and Chrome DevTools MCP doesn't list extension pages either, so an Agent can't press Allow for itself or another.
 - The connection is served on loopback only, and the Helper refuses any connection that doesn't come from this computer.
-- Clients on the stateless MCP protocol keep no session. They count as connected for a few minutes after their last call, and disconnecting one refuses its next call.
+- Clients on the stateless MCP protocol keep no session. They count as connected for a few minutes after their last call, and disconnecting one means its next call asks the person again.
+- A client must give a name of at most 64 characters, so the person can tell clients apart. Without the built-in extension nothing can ask the person, so only clients allowed before get in.
+- The prompt opens with nothing focused and its buttons wait a moment, so a key meant for another window can't answer it.

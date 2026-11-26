@@ -207,7 +207,7 @@ async fn the_person_answers_in_cohelms_prompt_and_agents_list() {
     in_page(
         &helper,
         "allow.html",
-        "true",
+        "!document.getElementById('allow').disabled",
         "document.getElementById('allow').click(); true",
     )
     .await;

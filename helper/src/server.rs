@@ -39,7 +39,9 @@ const PRUNE_EVERY: Duration = Duration::from_secs(2);
 struct Helper {
     backend: Arc<Backend>,
     agents: Arc<Agents>,
-    approval_wait: Duration,
+    /// How long a new Agent's call waits for the person, or None when
+    /// nothing in Cohelm can ask them.
+    approval_wait: Option<Duration>,
 }
 
 impl ServerHandler for Helper {
@@ -112,18 +114,32 @@ fn refused(request: &CallToolRequestParams) -> Option<&'static str> {
 }
 
 /// Pages an Agent may not open: the browser's own and its extensions'.
+/// The address is read as Chromium reads it, which drops tabs and newlines
+/// anywhere and control characters and spaces at either end, and looks
+/// inside wrappers such as `view-source:`.
 fn browser_own_page(url: &str) -> bool {
-    let url = url.trim_start().to_ascii_lowercase();
-    [
-        "chrome:",
-        "chrome-extension:",
-        "chrome-untrusted:",
-        "devtools:",
-        "about:",
-    ]
-    .iter()
-    .any(|scheme| url.starts_with(scheme))
-        && url != "about:blank"
+    let read: String = url
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    let mut url = read.trim_matches(|c: char| c <= ' ').to_ascii_lowercase();
+    while let Some(inner) = ["view-source:", "filesystem:", "blob:"]
+        .iter()
+        .find_map(|wrapper| url.strip_prefix(wrapper))
+    {
+        url = inner.trim_start_matches(|c: char| c <= ' ').to_owned();
+    }
+    url != "about:blank"
+        && [
+            "chrome:",
+            "chrome-extension:",
+            "chrome-untrusted:",
+            "chrome-search:",
+            "devtools:",
+            "about:",
+        ]
+        .iter()
+        .any(|scheme| url.starts_with(scheme))
 }
 
 /// A running Helper. Calling [`RunningHelper::stop`] closes the browser and
@@ -407,7 +423,11 @@ pub async fn start(config: HelperConfig) -> Result<RunningHelper, HelperError> {
     let helper = Helper {
         backend: backend.clone(),
         agents: control.agents.clone(),
-        approval_wait: config.approval_wait,
+        approval_wait: config
+            .browser
+            .extension_dir
+            .is_some()
+            .then_some(config.approval_wait),
     };
     let service: StreamableHttpService<Helper, LocalSessionManager> = StreamableHttpService::new(
         move || Ok(helper.clone()),
@@ -512,6 +532,10 @@ mod tests {
             "chrome-untrusted://print",
             "devtools://devtools/bundled/inspector.html",
             "about:settings",
+            "chr\tome-extension://dojelhkgldmdbffaafmofoilmbbacppo/agents.html",
+            "\u{1}chrome://settings",
+            "view-source:chrome://settings",
+            "view-source: blob:chrome-extension://x/y",
         ] {
             assert!(browser_own_page(url), "{url}");
         }

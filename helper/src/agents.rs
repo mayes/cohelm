@@ -37,6 +37,13 @@ pub enum Refusal {
     Declined(String),
     /// The person hasn't answered yet.
     Waiting(String),
+    /// Nothing in Cohelm can ask the person: the built-in extension isn't
+    /// loaded.
+    CantAsk(String),
+    /// The client gave no name, so the person couldn't tell it apart.
+    Unnamed,
+    /// The client's name is longer than the person could read.
+    LongName,
 }
 
 impl std::fmt::Display for Refusal {
@@ -51,6 +58,19 @@ impl std::fmt::Display for Refusal {
                 f,
                 "Cohelm is asking the person whether {name} may use their browser. \
                  Ask them to answer in Cohelm, then try again."
+            ),
+            Self::CantAsk(name) => write!(
+                f,
+                "Cohelm can't ask the person about {name}: its built-in extension isn't \
+                 loaded. Start Cohelm with it (COHELM_EXTENSION_DIR when run from source)."
+            ),
+            Self::Unnamed => write!(
+                f,
+                "Cohelm lets in only MCP clients that give their name (clientInfo.name)."
+            ),
+            Self::LongName => write!(
+                f,
+                "Cohelm lets in only MCP clients whose name is at most {MAX_NAME} characters."
             ),
         }
     }
@@ -112,7 +132,7 @@ impl Agents {
                     .into_iter()
                     .flatten()
                     .filter_map(Value::as_str)
-                    .map(name_of)
+                    .filter_map(|n| name_of(n).ok())
                     .collect()
             })
             .unwrap_or_default();
@@ -127,24 +147,31 @@ impl Agents {
     }
 
     /// Let a call from `name` through once the person has allowed it,
-    /// waiting up to `wait` for them to answer.
+    /// waiting up to `wait` for them to answer. With no `wait`, nothing can
+    /// ask the person, so only Agents allowed before get in.
     pub(crate) async fn admit(
         &self,
         name: &str,
         session: Option<SessionId>,
-        wait: Duration,
+        wait: Option<Duration>,
     ) -> Result<(), Refusal> {
-        let name = name_of(name);
+        let name = name_of(name)?;
         let answered = {
             let mut state = self.lock();
             if state.allowed.contains(&name) {
+                let fresh = saw(&mut state, name, session);
                 drop(state);
-                self.saw(name, session);
+                if fresh {
+                    self.bump();
+                }
                 return Ok(());
             }
             if state.declined.contains(&name) {
                 return Err(Refusal::Declined(name));
             }
+            let Some(wait) = wait else {
+                return Err(Refusal::CantAsk(name));
+            };
             let (answer, answered) = oneshot::channel();
             let waiting = state.asking.entry(name.clone()).or_default();
             let new = waiting.is_empty();
@@ -154,11 +181,20 @@ impl Agents {
                 tracing::info!("{name} asks to use the browser");
                 self.bump();
             }
-            answered
+            (answered, wait)
         };
-        match tokio::time::timeout(wait, answered).await {
+        match tokio::time::timeout(answered.1, answered.0).await {
             Ok(Ok(true)) => {
-                self.saw(name, session);
+                let mut state = self.lock();
+                // Disconnected again since: the next call asks again.
+                if !state.allowed.contains(&name) {
+                    return Err(Refusal::Waiting(name));
+                }
+                let fresh = saw(&mut state, name, session);
+                drop(state);
+                if fresh {
+                    self.bump();
+                }
                 Ok(())
             }
             Ok(Ok(false)) => Err(Refusal::Declined(name)),
@@ -172,31 +208,12 @@ impl Agents {
         }
     }
 
-    /// Count a call from an allowed Agent.
-    fn saw(&self, name: String, session: Option<SessionId>) {
-        let mut state = self.lock();
-        let mut fresh = false;
-        let seen = state.seen.entry(name).or_insert_with(|| {
-            fresh = true;
-            Seen {
-                sessions: HashSet::new(),
-                last: Instant::now(),
-            }
-        });
-        seen.last = Instant::now();
-        if let Some(session) = session {
-            fresh |= seen.sessions.insert(session);
-        }
-        drop(state);
-        if fresh {
-            self.bump();
-        }
-    }
-
     /// The person's answer for `name`. Allowing is remembered across
     /// restarts; declining lasts until Cohelm restarts.
     pub fn answer(&self, name: &str, allow: bool) {
-        let name = name_of(name);
+        let Ok(name) = name_of(name) else {
+            return;
+        };
         let mut state = self.lock();
         if allow {
             state.declined.remove(&name);
@@ -223,7 +240,9 @@ impl Agents {
     /// Forget `name`'s approval and return its sessions, to be ended. Its
     /// next call asks the person again.
     pub fn disconnect(&self, name: &str) -> Vec<SessionId> {
-        let name = name_of(name);
+        let Ok(name) = name_of(name) else {
+            return Vec::new();
+        };
         let mut state = self.lock();
         state.allowed.remove(&name);
         let sessions = state
@@ -316,21 +335,36 @@ impl Agents {
     }
 }
 
-/// The name the person sees: trimmed, without control characters, and cut
-/// to [`MAX_NAME`] characters.
-fn name_of(given: &str) -> String {
-    let name: String = given
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect::<String>()
-        .trim()
-        .chars()
-        .take(MAX_NAME)
-        .collect();
+/// Count a call from an allowed Agent, under the same lock as the check
+/// that it is allowed. True if it's newly connected.
+fn saw(state: &mut State, name: String, session: Option<SessionId>) -> bool {
+    let mut fresh = false;
+    let seen = state.seen.entry(name).or_insert_with(|| {
+        fresh = true;
+        Seen {
+            sessions: HashSet::new(),
+            last: Instant::now(),
+        }
+    });
+    seen.last = Instant::now();
+    if let Some(session) = session {
+        fresh |= seen.sessions.insert(session);
+    }
+    fresh
+}
+
+/// The name the person sees and approves: the client's own, without control
+/// characters or spaces at either end. Each client is told apart by it, so
+/// one with no name, or one too long to read, isn't let in.
+fn name_of(given: &str) -> Result<String, Refusal> {
+    let name: String = given.chars().filter(|c| !c.is_control()).collect();
+    let name = name.trim();
     if name.is_empty() {
-        "An unnamed client".to_owned()
+        Err(Refusal::Unnamed)
+    } else if name.chars().count() > MAX_NAME {
+        Err(Refusal::LongName)
     } else {
-        name
+        Ok(name.to_owned())
     }
 }
 
@@ -347,7 +381,11 @@ mod tests {
             let agents = agents.clone();
             async move {
                 agents
-                    .admit("claude-code", Some("s1".into()), Duration::from_secs(5))
+                    .admit(
+                        "claude-code",
+                        Some("s1".into()),
+                        Some(Duration::from_secs(5)),
+                    )
                     .await
             }
         });
@@ -369,17 +407,30 @@ mod tests {
         let agents = Agents::load(None);
         agents.answer("stranger", false);
         assert_eq!(
-            agents.admit("stranger", None, SHORT).await,
+            agents.admit("stranger", None, Some(SHORT)).await,
             Err(Refusal::Declined("stranger".into()))
         );
         assert!(agents.snapshot().asking.is_empty());
     }
 
     #[tokio::test]
+    async fn with_nothing_to_ask_only_agents_allowed_before_get_in() {
+        let agents = Agents::load(None);
+        agents.answer("known", true);
+        assert_eq!(agents.admit("known", None, None).await, Ok(()));
+        assert_eq!(
+            agents.admit("new", None, None).await,
+            Err(Refusal::CantAsk("new".into()))
+        );
+        assert!(agents.snapshot().asking.is_empty());
+        assert_eq!(agents.admit("", None, None).await, Err(Refusal::Unnamed));
+    }
+
+    #[tokio::test]
     async fn an_unanswered_agent_is_told_to_wait_and_still_asks() {
         let agents = Agents::load(None);
         assert_eq!(
-            agents.admit("slow", None, SHORT).await,
+            agents.admit("slow", None, Some(SHORT)).await,
             Err(Refusal::Waiting("slow".into()))
         );
         assert_eq!(agents.snapshot().asking, ["slow"]);
@@ -392,13 +443,13 @@ mod tests {
         let agents = Agents::load(Some(file.clone()));
         agents.answer("claude-code", true);
         agents
-            .admit("claude-code", Some("s1".into()), SHORT)
+            .admit("claude-code", Some("s1".into()), Some(SHORT))
             .await
             .unwrap();
 
         let restarted = Agents::load(Some(file.clone()));
         assert_eq!(
-            restarted.admit("claude-code", None, SHORT).await,
+            restarted.admit("claude-code", None, Some(SHORT)).await,
             Ok(()),
             "an allowed Agent isn't asked again"
         );
@@ -408,7 +459,7 @@ mod tests {
         assert!(agents.snapshot().connected.is_empty());
         let restarted = Agents::load(Some(file));
         assert_eq!(
-            restarted.admit("claude-code", None, SHORT).await,
+            restarted.admit("claude-code", None, Some(SHORT)).await,
             Err(Refusal::Waiting("claude-code".into())),
             "a disconnected Agent asks again"
         );
@@ -418,7 +469,10 @@ mod tests {
     async fn ended_sessions_drop_off_the_connected_list() {
         let agents = Agents::load(None);
         agents.answer("a", true);
-        agents.admit("a", Some("s1".into()), SHORT).await.unwrap();
+        agents
+            .admit("a", Some("s1".into()), Some(SHORT))
+            .await
+            .unwrap();
         agents.prune(|_| true);
         assert_eq!(agents.snapshot().connected, ["a"]);
         agents.prune(|_| false);
@@ -438,9 +492,13 @@ mod tests {
 
     #[test]
     fn names_are_cleaned_up_for_the_person() {
-        assert_eq!(name_of("  claude-code \n"), "claude-code");
-        assert_eq!(name_of("a\u{7}b"), "ab");
-        assert_eq!(name_of(""), "An unnamed client");
-        assert_eq!(name_of(&"x".repeat(100)).len(), MAX_NAME);
+        assert_eq!(name_of("  claude-code \n"), Ok("claude-code".into()));
+        assert_eq!(name_of("a\u{7}b"), Ok("ab".into()));
+        assert_eq!(name_of(" \n"), Err(Refusal::Unnamed));
+        assert_eq!(
+            name_of(&"x".repeat(MAX_NAME)).map(|n| n.len()),
+            Ok(MAX_NAME)
+        );
+        assert_eq!(name_of(&"x".repeat(MAX_NAME + 1)), Err(Refusal::LongName));
     }
 }

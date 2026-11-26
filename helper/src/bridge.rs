@@ -128,7 +128,7 @@ impl Asker {
     pub async fn attach(&self, target: &str) -> Result<String, HelperError> {
         let attached = self
             .send(
-                Command::Attach(target.to_owned()),
+                Command::Attach,
                 "Target.attachToTarget",
                 json!({ "targetId": target, "flatten": true }),
             )
@@ -189,8 +189,8 @@ enum Event {
 enum Command {
     Browser,
     Session(String),
-    /// Attaching to this target for the Helper.
-    Attach(String),
+    /// Attaching to a target for the Helper.
+    Attach,
 }
 
 #[derive(Clone)]
@@ -316,8 +316,9 @@ struct Client {
     tx: mpsc::Sender<String>,
     /// Every session the browser attached for this client.
     sessions: HashSet<String>,
-    /// The top-level ones, which the relay lets go of when the client goes.
-    roots: HashSet<String>,
+    /// The top-level ones, with their targets, which the relay lets go of
+    /// when the client goes.
+    roots: HashMap<String, String>,
 }
 
 struct Relay {
@@ -330,11 +331,11 @@ struct Relay {
     own_id: u64,
     /// The Helper's own commands still waiting on the browser.
     asked: HashMap<u64, oneshot::Sender<Result<Value, String>>>,
-    /// The Helper's own attaches still waiting, by command id, to the target.
-    attaching: HashMap<u64, String>,
-    /// News of an attach to a target the Helper is attaching to, held until
-    /// its reply says whether the attach is the Helper's or the client's.
-    held: HashMap<String, Vec<String>>,
+    /// The Helper's own attaches still waiting on the browser, by command id.
+    attaching: HashSet<u64>,
+    /// What the browser sent while the Helper was attaching, in order, held
+    /// until its reply says which news of an attach is the Helper's.
+    held: Vec<String>,
     /// Sessions the Helper attached for itself. The client never hears of
     /// them.
     own_sessions: HashSet<String>,
@@ -350,8 +351,8 @@ impl Relay {
             next_id: 0,
             own_id: OWN_IDS - 1,
             asked: HashMap::new(),
-            attaching: HashMap::new(),
-            held: HashMap::new(),
+            attaching: HashSet::new(),
+            held: Vec::new(),
             own_sessions: HashSet::new(),
             watchers,
         }
@@ -371,7 +372,7 @@ impl Relay {
                         id,
                         tx,
                         sessions: HashSet::new(),
-                        roots: HashSet::new(),
+                        roots: HashMap::new(),
                     });
                 }
                 Event::Disconnected(id) => {
@@ -390,9 +391,9 @@ impl Relay {
                         Command::Session(session) => {
                             self.send_own(&method, params, Some(&session)).await
                         }
-                        Command::Attach(target) => {
+                        Command::Attach => {
                             let id = self.send_own(&method, params, None).await;
-                            self.attaching.insert(id, target);
+                            self.attaching.insert(id);
                             id
                         }
                     };
@@ -422,30 +423,15 @@ impl Relay {
     }
 
     async fn on_browser_message(&mut self, text: String) {
-        let Ok(mut message) = serde_json::from_str::<Value>(&text) else {
+        let Ok(message) = serde_json::from_str::<Value>(&text) else {
             return;
         };
         if let Some(id) = message.get("id").and_then(Value::as_u64) {
-            if let Some(target) = self.attaching.remove(&id) {
-                let ours = message.pointer("/result/sessionId").and_then(Value::as_str);
-                if let Some(session) = ours {
-                    self.own_sessions.insert(session.to_owned());
-                }
-                // Pass on any attach to the same target that was the client's.
-                let theirs: Vec<String> = self
-                    .held
-                    .remove(&target)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|text| {
-                        serde_json::from_str::<Value>(text).ok().is_some_and(|m| {
-                            m.pointer("/params/sessionId").and_then(Value::as_str) != ours
-                        })
-                    })
-                    .collect();
-                for text in theirs {
-                    Box::pin(self.on_browser_message(text)).await;
-                }
+            let attached = self.attaching.remove(&id);
+            if attached
+                && let Some(session) = message.pointer("/result/sessionId").and_then(Value::as_str)
+            {
+                self.own_sessions.insert(session.to_owned());
             }
             if let Some(answer) = self.asked.remove(&id) {
                 let result = match message.get("error") {
@@ -453,8 +439,52 @@ impl Relay {
                     None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
                 };
                 let _ = answer.send(result);
-                return;
+            } else if id < OWN_IDS {
+                self.hold_or_route(text, message).await;
             }
+            if attached {
+                self.release_held().await;
+            }
+            return;
+        }
+        if let Some(error) = message.get("error") {
+            // The browser couldn't read a command well enough to say which.
+            tracing::warn!("the browser refused a command: {error}");
+            return;
+        }
+        self.hold_or_route(text, message).await;
+    }
+
+    /// While the Helper is attaching to a target, the browser's news of that
+    /// attach can't yet be told from the client's, so everything bound for
+    /// the client waits, in order, until the Helper's reply comes.
+    async fn hold_or_route(&mut self, text: String, message: Value) {
+        let own_event = message
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .is_some_and(|p| self.own_sessions.contains(p));
+        if !own_event && !self.attaching.is_empty() {
+            self.held.push(text);
+            return;
+        }
+        self.route(text, message).await;
+    }
+
+    async fn release_held(&mut self) {
+        if !self.attaching.is_empty() {
+            return;
+        }
+        for text in std::mem::take(&mut self.held) {
+            if let Ok(message) = serde_json::from_str::<Value>(&text) {
+                self.route(text, message).await;
+            }
+        }
+    }
+
+    /// Pass a reply or event to whoever it's for: the Helper, the client, or
+    /// no one.
+    async fn route(&mut self, text: String, mut message: Value) {
+        if let Some(id) = message.get("id").and_then(Value::as_u64) {
             // A reply: back to the client that asked, under its own id, and
             // to no one else.
             let Some((asker, own)) = self.pending.remove(&id) else {
@@ -464,12 +494,6 @@ impl Relay {
                 message["id"] = own;
                 self.send_to_client(message.to_string()).await;
             }
-            return;
-        }
-
-        if let Some(error) = message.get("error") {
-            // The browser couldn't read a command well enough to say which.
-            tracing::warn!("the browser refused a command: {error}");
             return;
         }
         let parent = message
@@ -490,22 +514,42 @@ impl Relay {
             let _ = self.watchers.send(message);
             return;
         }
+        let info = message.pointer("/params/targetInfo");
+        let cohelm_page = info.is_some_and(|i| crate::pages::cohelm_page(i).is_some());
         match (method, &session) {
-            (Some("Target.attachedToTarget"), Some(_)) if parent.is_none() => {
-                let target = message
-                    .pointer("/params/targetInfo/targetId")
-                    .and_then(Value::as_str);
-                if let Some(target) = target.filter(|t| self.attaching.values().any(|a| a == t)) {
-                    self.held.entry(target.to_owned()).or_default().push(text);
-                    return;
-                }
+            (Some("Target.attachedToTarget"), Some(attached))
+                if self.own_sessions.contains(attached) =>
+            {
+                return;
             }
             (Some("Target.detachedFromTarget"), Some(gone)) if self.own_sessions.remove(gone) => {
                 let _ = self.watchers.send(message);
                 return;
             }
+            // Cohelm's own pages are the person's: the client is never
+            // attached to them, so an Agent can't answer for the person.
+            (Some("Target.attachedToTarget"), Some(attached))
+                if parent.is_none() && cohelm_page =>
+            {
+                let attached = attached.clone();
+                self.let_go(&attached).await;
+                return;
+            }
             (Some(m), _) if parent.is_none() && m.starts_with("Target.target") => {
                 let _ = self.watchers.send(message.clone());
+                if m == "Target.targetInfoChanged" && cohelm_page {
+                    // A tab that became one of Cohelm's pages.
+                    let target = info.and_then(|i| i["targetId"].as_str());
+                    let theirs = self.client.as_ref().and_then(|c| {
+                        c.roots
+                            .iter()
+                            .find(|(_, t)| Some(t.as_str()) == target)
+                            .map(|(s, _)| s.clone())
+                    });
+                    if let Some(theirs) = theirs {
+                        self.let_go(&theirs).await;
+                    }
+                }
             }
             _ => {}
         }
@@ -517,7 +561,10 @@ impl Relay {
                     return;
                 }
                 if parent.is_none() {
-                    client.roots.insert(session.clone());
+                    let target = info
+                        .and_then(|i| i["targetId"].as_str())
+                        .unwrap_or_default();
+                    client.roots.insert(session.clone(), target.to_owned());
                 }
                 client.sessions.insert(session);
             }
@@ -581,7 +628,7 @@ impl Relay {
             None,
         )
         .await;
-        for session in &client.roots {
+        for session in client.roots.keys() {
             self.let_go(session).await;
         }
     }
@@ -735,7 +782,7 @@ mod tests {
             let (answer, answered) = oneshot::channel();
             events
                 .send(Event::Ask(
-                    Command::Attach(target.into()),
+                    Command::Attach,
                     "Target.attachToTarget".into(),
                     json!({ "targetId": target, "flatten": true }),
                     answer,
@@ -785,6 +832,39 @@ mod tests {
         assert!(
             heard.try_recv().is_err(),
             "the client hears nothing of the Helper's sessions"
+        );
+
+        // Two attaches of the Helper's own to one target: neither reaches
+        // the client.
+        let (first, second) = (attach("T3"), attach("T3"));
+        let ids = [
+            sent_id(pipe.recv().await.unwrap()),
+            sent_id(pipe.recv().await.unwrap()),
+        ];
+        from_browser(attached("own3", "T3"));
+        from_browser(json!({ "id": ids[0], "result": { "sessionId": "own3" } }));
+        from_browser(attached("own4", "T3"));
+        from_browser(json!({ "id": ids[1], "result": { "sessionId": "own4" } }));
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(heard.try_recv().is_err(), "the client hears of neither");
+
+        // The client is never attached to Cohelm's own pages: the relay lets
+        // the page go instead of telling the client.
+        from_browser(json!({ "method": "Target.attachedToTarget", "params": {
+            "sessionId": "page", "waitingForDebugger": true, "targetInfo": {
+                "targetId": "P", "type": "page",
+                "url": format!("chrome-extension://{}/allow.html", crate::EXTENSION_ID) } } }));
+        let resumed: Value = serde_json::from_str(&pipe.recv().await.unwrap()).unwrap();
+        assert_eq!(resumed["method"], "Runtime.runIfWaitingForDebugger");
+        assert_eq!(resumed["sessionId"], "page");
+        let detached: Value = serde_json::from_str(&pipe.recv().await.unwrap()).unwrap();
+        assert_eq!(detached["method"], "Target.detachFromTarget");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            heard.try_recv().is_err(),
+            "the client isn't told of Cohelm's page"
         );
     }
 

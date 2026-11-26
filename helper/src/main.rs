@@ -38,7 +38,14 @@ async fn main() -> anyhow::Result<()> {
     let mut browser = BrowserCommand::new(program, profile_dir);
     browser.extension_dir = std::env::var_os("COHELM_EXTENSION_DIR")
         .map(PathBuf::from)
-        .or_else(|| installed.as_ref().map(|l| l.extension.clone()));
+        .or_else(|| installed.as_ref().map(|l| l.extension.clone()))
+        .or_else(dev_extension_dir);
+    if browser.extension_dir.is_none() {
+        tracing::warn!(
+            "no built-in extension: only Agents allowed before can connect, \
+             since nothing can ask the person about a new one"
+        );
+    }
     // Pages to open, as for any browser. Anything that looks like a switch
     // is dropped, so nothing can change how the browser runs this way.
     let pages: Vec<OsString> = std::env::args_os()
@@ -205,4 +212,14 @@ fn default_profile_dir() -> anyhow::Result<PathBuf> {
     let base =
         base.context("can't find a folder for the browser profile; set COHELM_PROFILE_DIR")?;
     Ok(base.join("Cohelm").join("User Data"))
+}
+
+/// A development build run from the repo uses the extension beside it, so
+/// the prompt works without setting `COHELM_EXTENSION_DIR`.
+fn dev_extension_dir() -> Option<PathBuf> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../extension");
+    dir.join("manifest.json").is_file().then_some(dir)
 }

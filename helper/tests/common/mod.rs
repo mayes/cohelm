@@ -36,13 +36,14 @@ pub const TEST_AGENT: &str = "cohelm-test-agent";
 pub async fn connect_as(
     name: &str,
     url: &str,
-) -> Result<Agent, rmcp::service::ClientInitializeError> {
+) -> Result<Agent, Box<rmcp::service::ClientInitializeError>> {
     ClientConfig::new(
         ClientCapabilities::default(),
         Implementation::new(name, "1.0"),
     )
     .serve(StreamableHttpClientTransport::from_uri(url.to_owned()))
     .await
+    .map_err(Box::new)
 }
 
 /// The Chromium the browser tests run, from COHELM_TEST_CHROME. None skips

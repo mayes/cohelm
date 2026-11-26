@@ -24,6 +24,9 @@ pub(crate) const PROMPT: &str = "allow.html";
 const BINDING: &str = "cohelmSend";
 /// How often the Helper looks for Cohelm pages it hasn't seen opening.
 const LOOK_EVERY: Duration = Duration::from_secs(1);
+/// How many times the Helper tries to reach a Cohelm page, about once a
+/// second, before it gives up on it.
+const MAX_TRIES: u32 = 10;
 
 fn page_prefix() -> String {
     format!("chrome-extension://{EXTENSION_ID}/")
@@ -43,7 +46,7 @@ pub(crate) async fn run(
         mcp_url,
         attached: HashMap::new(),
         prompts: HashMap::new(),
-        failed: HashSet::new(),
+        failed: HashMap::new(),
     };
     let mut events = browser.watch();
     let mut changed = control.agents.watch();
@@ -77,8 +80,8 @@ struct Pages {
     /// Prompt windows the Helper opened, by target, with the Agent each asks
     /// about. Only these may answer for that Agent.
     prompts: HashMap<String, String>,
-    /// Targets the Helper couldn't attach to, so it doesn't keep trying.
-    failed: HashSet<String>,
+    /// Targets the Helper couldn't attach to, with how many times it tried.
+    failed: HashMap<String, u32>,
 }
 
 impl Pages {
@@ -87,24 +90,30 @@ impl Pages {
         let Ok(targets) = self.browser.ask("Target.getTargets", json!({})).await else {
             return;
         };
-        let open: Vec<(String, String)> = targets["targetInfos"]
+        let all: Vec<&Value> = targets["targetInfos"]
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(|t| Some((t["targetId"].as_str()?.to_owned(), cohelm_page(t)?)))
             .collect();
-        let ids: HashSet<&String> = open.iter().map(|(id, _)| id).collect();
+        // Gone means gone from the browser: a new prompt may not show its
+        // address yet.
+        let ids: HashSet<&str> = all.iter().filter_map(|t| t["targetId"].as_str()).collect();
+        let open: Vec<String> = all
+            .iter()
+            .filter(|t| cohelm_page(t).is_some())
+            .filter_map(|t| Some(t["targetId"].as_str()?.to_owned()))
+            .collect();
         let gone: Vec<String> = self
             .attached
             .keys()
             .chain(self.prompts.keys())
-            .filter(|id| !ids.contains(id))
+            .filter(|id| !ids.contains(id.as_str()))
             .cloned()
             .collect();
         for target in gone {
             self.closed(&target);
         }
-        for (target, _) in open {
+        for target in open {
             self.found(&target).await;
         }
     }
@@ -150,7 +159,8 @@ impl Pages {
 
     /// A Cohelm page is open: attach to it and give it the lists.
     async fn found(&mut self, target: &str) {
-        if self.attached.contains_key(target) || self.failed.contains(target) {
+        let tries = self.failed.get(target).copied().unwrap_or(0);
+        if self.attached.contains_key(target) || tries >= MAX_TRIES {
             return;
         }
         match self.attach(target).await {
@@ -159,20 +169,31 @@ impl Pages {
                 self.push(target).await;
             }
             Err(e) => {
-                tracing::warn!("couldn't reach one of Cohelm's pages: {e}");
-                self.failed.insert(target.to_owned());
+                if tries + 1 == MAX_TRIES {
+                    tracing::warn!("couldn't reach one of Cohelm's pages: {e}");
+                }
+                self.failed.insert(target.to_owned(), tries + 1);
             }
         }
     }
 
     async fn attach(&self, target: &str) -> Result<String, HelperError> {
         let session = self.browser.attach(target).await?;
-        self.browser
-            .ask_in(&session, "Runtime.enable", json!({}))
-            .await?;
-        self.browser
-            .ask_in(&session, "Runtime.addBinding", json!({ "name": BINDING }))
-            .await?;
+        let ready = async {
+            self.browser
+                .ask_in(&session, "Runtime.enable", json!({}))
+                .await?;
+            self.browser
+                .ask_in(&session, "Runtime.addBinding", json!({ "name": BINDING }))
+                .await
+        };
+        if let Err(e) = ready.await {
+            let _ = self
+                .browser
+                .ask("Target.detachFromTarget", json!({ "sessionId": session }))
+                .await;
+            return Err(e);
+        }
         Ok(session)
     }
 
@@ -300,7 +321,7 @@ pub(crate) fn connection_details(mcp_url: &str) -> Value {
 
 /// The page's address, if it's one of Cohelm's pages a person sees. The
 /// extension's service worker isn't.
-fn cohelm_page(info: &Value) -> Option<String> {
+pub(crate) fn cohelm_page(info: &Value) -> Option<String> {
     let url = info["url"].as_str()?;
     (info["type"] != "service_worker" && url.starts_with(&page_prefix())).then(|| url.to_owned())
 }
