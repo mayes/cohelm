@@ -16,7 +16,7 @@ use std::{
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::{EXTENSION_ID, bridge::Asker, config::HelperError, server::Control};
+use crate::{EXTENSION_ID, bridge::Asker, config::HelperError, server::Control, updates::Update};
 
 /// The page that asks the person about a new Agent.
 pub(crate) const PROMPT: &str = "allow.html";
@@ -47,9 +47,11 @@ pub(crate) async fn run(
         attached: HashMap::new(),
         prompts: HashMap::new(),
         failed: HashMap::new(),
+        badged: false,
     };
     let mut events = browser.watch();
     let mut changed = control.agents.watch();
+    let mut update = control.update.subscribe();
     let mut look = tokio::time::interval(LOOK_EVERY);
     loop {
         tokio::select! {
@@ -60,6 +62,13 @@ pub(crate) async fn run(
                     return;
                 }
                 pages.agents_changed().await;
+            }
+            seen = update.changed() => {
+                if seen.is_err() {
+                    return;
+                }
+                pages.badge().await;
+                pages.push_all().await;
             }
             event = events.recv() => match event {
                 Ok(event) => pages.on_event(event).await,
@@ -82,6 +91,8 @@ struct Pages {
     prompts: HashMap<String, String>,
     /// Targets the Helper couldn't attach to, with how many times it tried.
     failed: HashMap<String, u32>,
+    /// Whether Cohelm's toolbar button shows that an update is out.
+    badged: bool,
 }
 
 impl Pages {
@@ -127,6 +138,8 @@ impl Pages {
                     // Try again: a page that just loaded may answer now.
                     self.failed.remove(target);
                     self.found(target).await;
+                } else if method == "Target.targetCreated" && background(info) {
+                    self.badge().await;
                 }
             }
             "Target.targetDestroyed" => {
@@ -231,9 +244,59 @@ impl Pages {
                 self.open_prompt(&name).await;
             }
         }
-        let targets: Vec<String> = self.attached.keys().cloned().collect();
-        for target in targets {
-            self.push(&target).await;
+        self.push_all().await;
+    }
+
+    async fn push_all(&self) {
+        for target in self.attached.keys() {
+            self.push(target).await;
+        }
+    }
+
+    /// Mark Cohelm's toolbar button while an update is out, so the person
+    /// sees it without opening the Agents list. The button is set from the
+    /// extension's background worker, when it's running.
+    async fn badge(&mut self) {
+        let out = self.control.update.borrow().is_some();
+        if out == self.badged {
+            return;
+        }
+        let Ok(targets) = self.browser.ask("Target.getTargets", json!({})).await else {
+            return;
+        };
+        let Some(worker) = targets["targetInfos"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|t| background(t))
+            .and_then(|t| t["targetId"].as_str())
+        else {
+            return;
+        };
+        let Ok(session) = self.browser.attach(worker).await else {
+            return;
+        };
+        let text = if out { "1" } else { "" };
+        let set = self
+            .browser
+            .ask_in(
+                &session,
+                "Runtime.evaluate",
+                json!({
+                    "expression": format!(
+                        "chrome.action.setBadgeText({{ text: {text:?} }}).then(() => true)"
+                    ),
+                    "awaitPromise": true,
+                    "returnByValue": true,
+                }),
+            )
+            .await;
+        let _ = self
+            .browser
+            .ask("Target.detachFromTarget", json!({ "sessionId": session }))
+            .await;
+        if set.is_ok_and(|r| r["result"]["value"] == true) {
+            self.badged = out;
         }
     }
 
@@ -288,8 +351,11 @@ impl Pages {
         let Some(session) = self.attached.get(target) else {
             return;
         };
+        let update = self.control.update.borrow().as_ref().map(Update::to_json);
         let state = json!({
             "asking": self.prompts.get(target),
+            "update": update,
+            "version": env!("CARGO_PKG_VERSION"),
             "agents": self.control.agents.snapshot().to_json(),
             "connect": connection_details(&self.mcp_url),
         });
@@ -317,6 +383,19 @@ pub(crate) fn connection_details(mcp_url: &str) -> Value {
         "json": json!({ "mcpServers": { "cohelm": { "type": "http", "url": mcp_url } } })
             .to_string(),
     })
+}
+
+/// Whether the target is anything of Cohelm's extension, its background
+/// worker included. Agents never attach to these.
+pub(crate) fn cohelm_target(info: &Value) -> bool {
+    info["url"]
+        .as_str()
+        .is_some_and(|url| url.starts_with(&page_prefix()))
+}
+
+/// Whether the target is Cohelm's background worker.
+fn background(info: &Value) -> bool {
+    info["type"] == "service_worker" && cohelm_target(info)
 }
 
 /// The page's address, if it's one of Cohelm's pages a person sees. The

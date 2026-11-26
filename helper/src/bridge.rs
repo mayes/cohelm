@@ -515,7 +515,7 @@ impl Relay {
             return;
         }
         let info = message.pointer("/params/targetInfo");
-        let cohelm_page = info.is_some_and(|i| crate::pages::cohelm_page(i).is_some());
+        let cohelm_page = info.is_some_and(crate::pages::cohelm_target);
         match (method, &session) {
             (Some("Target.attachedToTarget"), Some(attached))
                 if self.own_sessions.contains(attached) =>

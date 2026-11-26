@@ -30,6 +30,10 @@ h1 { font-size: 17px; margin: 0 0 4px; }
 h2 { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 20px 0 8px; }
 p { margin: 0 0 12px; }
 .muted { color: var(--muted); }
+.notice { border: 1px solid var(--accent); border-radius: var(--radius); padding: 10px 12px; margin: 12px 0; background: var(--surface); }
+.notice p { margin: 0; }
+.notice p + p { margin-top: 6px; }
+.notice a { color: var(--accent); }
 .row { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-top: 1px solid var(--line); }
 .row:first-of-type { border-top: 0; }
 .row .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }

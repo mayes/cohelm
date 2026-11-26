@@ -25,7 +25,9 @@ use crate::{
     bridge, browser,
     config::{HelperConfig, HelperError},
     pages,
+    updates::{self, Update},
 };
+use tokio::sync::watch;
 
 /// The name the Helper gives Agents, and checks for when a second Cohelm
 /// finds its port taken.
@@ -162,6 +164,8 @@ pub struct RunningHelper {
 pub(crate) struct Control {
     pub agents: Arc<Agents>,
     sessions: Arc<LocalSessionManager>,
+    /// A newer Cohelm, once the Helper has seen one.
+    pub update: Arc<watch::Sender<Option<Update>>>,
 }
 
 impl Control {
@@ -195,6 +199,11 @@ impl RunningHelper {
     /// person does from Cohelm's Agents list.
     pub async fn disconnect(&self, name: &str) {
         self.control.disconnect(name).await;
+    }
+
+    /// A newer Cohelm, if the Helper has seen one.
+    pub fn update(&self) -> Option<Update> {
+        self.control.update.borrow().clone()
     }
 
     /// Whether Cohelm's built-in extension is running in the browser.
@@ -419,7 +428,15 @@ pub async fn start(config: HelperConfig) -> Result<RunningHelper, HelperError> {
     let control = Control {
         agents: Agents::load(config.agents_file.clone()),
         sessions: Arc::new(LocalSessionManager::default()),
+        update: Arc::new(watch::Sender::new(None)),
     };
+    if let Some(check) = config.updates.clone() {
+        tokio::spawn(updates::run(
+            check,
+            control.update.clone(),
+            cancel.child_token(),
+        ));
+    }
     let helper = Helper {
         backend: backend.clone(),
         agents: control.agents.clone(),

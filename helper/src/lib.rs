@@ -10,6 +10,7 @@ mod config;
 mod layout;
 mod pages;
 mod server;
+mod updates;
 
 /// Cohelm's built-in extension, fixed by the key in `extension/manifest.json`.
 pub const EXTENSION_ID: &str = "dojelhkgldmdbffaafmofoilmbbacppo";
@@ -21,3 +22,4 @@ pub use browser::BrowserCommand;
 pub use config::{HelperConfig, HelperError};
 pub use layout::{Layout, Platform};
 pub use server::{BrowserProbe, RunningHelper, SERVER_NAME, cohelm_at, start};
+pub use updates::{Update, UpdateCheck, newest};

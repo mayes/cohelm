@@ -5,8 +5,8 @@ use std::{ffi::OsString, net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::Context;
 use cohelm_helper::{
-    BrowserCommand, BrowserProbe, DevtoolsCommand, HelperConfig, HelperError, Layout, cohelm_at,
-    start,
+    BrowserCommand, BrowserProbe, DevtoolsCommand, HelperConfig, HelperError, Layout, UpdateCheck,
+    cohelm_at, start,
 };
 
 /// How long a second Cohelm waits for the first one to finish starting.
@@ -63,6 +63,16 @@ async fn main() -> anyhow::Result<()> {
         .collect();
     browser.args.extend(pages.iter().cloned());
     let mut config = HelperConfig::new(listen, browser.clone());
+    // Look for newer releases on GitHub. COHELM_UPDATE_FEED points the check
+    // at another feed for development, and an empty one turns it off.
+    config.updates = match std::env::var("COHELM_UPDATE_FEED") {
+        Ok(feed) if feed.is_empty() => None,
+        Ok(feed) => Some(UpdateCheck {
+            feed,
+            ..UpdateCheck::github()
+        }),
+        Err(_) => Some(UpdateCheck::github()),
+    };
     if let Ok(script) = std::env::var("COHELM_DEVTOOLS_MCP") {
         config.devtools = DevtoolsCommand::node_script(script);
     } else if let Some(layout) = &installed {

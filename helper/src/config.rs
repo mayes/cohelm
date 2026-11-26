@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use crate::{backend::DevtoolsCommand, browser::BrowserCommand};
+use crate::{backend::DevtoolsCommand, browser::BrowserCommand, updates::UpdateCheck};
 
 /// How the Helper is started.
 #[derive(Debug, Clone)]
@@ -17,6 +17,8 @@ pub struct HelperConfig {
     pub agents_file: Option<PathBuf>,
     /// How long a new Agent's call is held while the person decides.
     pub approval_wait: Duration,
+    /// How the Helper looks for a newer Cohelm. None never looks.
+    pub updates: Option<UpdateCheck>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +53,7 @@ impl HelperConfig {
             browser,
             devtools: DevtoolsCommand::default(),
             approval_wait: Duration::from_secs(60),
+            updates: None,
         }
     }
 

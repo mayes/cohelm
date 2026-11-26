@@ -54,6 +54,15 @@ const send = connect((state) => {
     ...declined.map((name) => row(name, "", action("Allow", "", () => send({ allowAgain: name })))),
   );
 
+  const update = state.update;
+  $("update").hidden = !update;
+  if (update) {
+    $("update-version").textContent = update.version;
+    $("current-version").textContent = state.version;
+    $("update-download").href = update.download;
+    $("update-notes").href = update.notes;
+  }
+
   details = state.connect;
   for (const key of ["url", "claudeCode", "json"]) $(key).textContent = details[key];
 }, {
