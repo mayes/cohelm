@@ -23,7 +23,7 @@ devtools-mcp\   Chrome DevTools MCP
 node\node.exe   Node, to run it
 ```
 
-The Mac app comes in a disk image. Windows gets an Inno Setup installer that needs no admin rights, adds a Start menu entry and starts Cohelm when it finishes. Uninstalling keeps the profile, as browsers do.
+The Mac app comes in a disk image. Windows gets an Inno Setup installer that needs no admin rights, adds a Start menu entry and starts Cohelm when it finishes. As Chrome's own installer does, it lets app containers read the install folder, since Chromium's sandboxed processes run as app containers and fail without it. Uninstalling keeps the profile, as browsers do.
 
 Node and Chrome DevTools MCP are downloaded at pinned versions and checked against pinned checksums (`browser/packaging/runtime.env`), so a release always ships the parts it was tested with and needs nothing installed on the person's computer. Chrome DevTools MCP has no dependencies of its own, so the npm tarball is all it needs.
 

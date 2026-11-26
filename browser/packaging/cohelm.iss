@@ -44,6 +44,10 @@ Name: "{userprograms}\Cohelm"; Filename: "{app}\Cohelm.exe"; IconFilename: "{app
 Name: "{userdesktop}\Cohelm"; Filename: "{app}\Cohelm.exe"; IconFilename: "{app}\browser\chrome.exe"; Tasks: desktopicon
 
 [Run]
+; Chromium's sandboxed processes run as app containers, which can't read a
+; folder in the person's own profile unless they're let in. Chrome's own
+; installer does the same; without it the network service keeps crashing.
+Filename: "{sys}\icacls.exe"; Parameters: """{app}"" /grant *S-1-15-2-1:(OI)(CI)(RX) *S-1-15-2-2:(OI)(CI)(RX) /T /C /Q"; StatusMsg: "Letting the browser's sandbox read its files..."; Flags: runhidden waituntilterminated
 Filename: "{app}\Cohelm.exe"; Description: "Start Cohelm"; Flags: nowait postinstall skipifsilent
 
 ; The profile in %LOCALAPPDATA%\Cohelm\User Data holds the person's logins

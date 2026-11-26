@@ -135,6 +135,9 @@ async fn report_extension(probe: BrowserProbe) {
     for _ in 0..50 {
         if let Ok(true) = probe.extension_running().await {
             tracing::info!("Cohelm's built-in extension is running");
+            if let Ok(kinds) = probe.target_kinds().await {
+                tracing::info!("browser targets: {}", kinds.join(", "));
+            }
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;

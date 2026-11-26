@@ -127,6 +127,28 @@ pub struct BrowserProbe {
 }
 
 impl BrowserProbe {
+    /// Each target's type and the scheme of its address, for the log. No
+    /// addresses, so the log holds nothing of where the person has been.
+    pub async fn target_kinds(&self) -> Result<Vec<String>, HelperError> {
+        let targets = self
+            .browser
+            .ask("Target.getTargets", serde_json::json!({}))
+            .await?;
+        Ok(targets["targetInfos"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|t| {
+                let kind = t["type"].as_str().unwrap_or("?");
+                let scheme = t["url"]
+                    .as_str()
+                    .and_then(|u| u.split_once(':'))
+                    .map_or("", |(s, _)| s);
+                format!("{kind} {scheme}")
+            })
+            .collect())
+    }
+
     /// Whether Cohelm's built-in extension is running in the browser.
     pub async fn extension_running(&self) -> Result<bool, HelperError> {
         let targets = self
