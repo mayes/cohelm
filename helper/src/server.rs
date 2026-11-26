@@ -82,10 +82,26 @@ pub struct RunningHelper {
     pub addr: SocketAddr,
     cancel: CancellationToken,
     task: JoinHandle<Result<(), HelperError>>,
+    browser: bridge::Asker,
     _stop_on_drop: DropGuard,
 }
 
 impl RunningHelper {
+    /// Whether Cohelm's built-in extension is running in the browser.
+    pub async fn extension_running(&self) -> Result<bool, HelperError> {
+        let targets = self
+            .browser
+            .ask("Target.getTargets", serde_json::json!({}))
+            .await?;
+        let page = format!("chrome-extension://{}/", crate::EXTENSION_ID);
+        Ok(targets["targetInfos"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t["url"].as_str())
+            .any(|url| url.starts_with(&page)))
+    }
+
     /// Shut the Helper down and wait for it to finish.
     pub async fn stop(self) {
         self.cancel.cancel();
@@ -110,7 +126,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
 pub async fn start(config: HelperConfig) -> Result<RunningHelper, HelperError> {
     config.validate()?;
     // Take the port first, so a busy port fails before anything starts.
-    let listener = tokio::net::TcpListener::bind(config.listen).await?;
+    let listener = match tokio::net::TcpListener::bind(config.listen).await {
+        Ok(listener) => listener,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            return Err(HelperError::AlreadyRunning(config.listen));
+        }
+        Err(e) => return Err(e.into()),
+    };
     let addr = listener.local_addr()?;
     let mut bridge = bridge::start(browser::launch(&config.browser)?).await?;
     // Only this user can read the folder (it's created 0700). Chrome DevTools
@@ -140,6 +162,7 @@ pub async fn start(config: HelperConfig) -> Result<RunningHelper, HelperError> {
         }
     };
 
+    let browser = bridge.asker();
     let cancel = CancellationToken::new();
     let helper = Helper {
         backend: backend.clone(),
@@ -189,5 +212,6 @@ pub async fn start(config: HelperConfig) -> Result<RunningHelper, HelperError> {
         _stop_on_drop: cancel.clone().drop_guard(),
         cancel,
         task,
+        browser,
     })
 }

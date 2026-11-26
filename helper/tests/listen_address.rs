@@ -47,3 +47,19 @@ async fn a_browser_that_wont_start_is_reported() {
         Err(HelperError::BrowserStart(_, _))
     ));
 }
+
+#[tokio::test]
+async fn a_second_cohelm_finds_the_first_one_running() {
+    let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let busy = first.local_addr().unwrap();
+    let profile = tempfile::tempdir().unwrap();
+    let config = HelperConfig::new(
+        busy,
+        BrowserCommand::new(profile.path().join("no-such-browser"), profile.path()),
+    );
+    // The port is checked before the browser starts.
+    assert!(matches!(
+        start(config).await,
+        Err(HelperError::AlreadyRunning(addr)) if addr == busy
+    ));
+}

@@ -35,8 +35,7 @@ jobs:
       - id: chrome
         shell: bash
         run: |
-          deps=$([ "$RUNNER_OS" = Linux ] && echo --install-deps || true)
-          out=$(npx -y @puppeteer/browsers@2 install chrome@stable --path "$RUNNER_TEMP/cft" $deps)
+          out=$(npx -y @puppeteer/browsers@2 install chrome@stable --path "$RUNNER_TEMP/cft")
           echo "$out"
           line=$(printf '%s\n' "$out" | tail -n 1)
           # "chrome@<version> <path>"; the path has spaces in it.

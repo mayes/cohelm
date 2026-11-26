@@ -55,6 +55,7 @@ pub(crate) struct Bridge {
     close: Option<oneshot::Sender<()>>,
     /// Taken once the browser has exited.
     exited: Option<oneshot::Receiver<()>>,
+    events: mpsc::UnboundedSender<Event>,
     cancel: CancellationToken,
 }
 
@@ -69,6 +70,13 @@ impl Bridge {
         self.cancel.cancel();
     }
 
+    /// A handle for sending the Helper's own commands to the browser.
+    pub fn asker(&self) -> Asker {
+        Asker {
+            events: self.events.clone(),
+        }
+    }
+
     /// Resolves when the browser has exited, for example because the person
     /// quit it. Safe to call again afterwards.
     pub async fn browser_exited(&mut self) {
@@ -76,6 +84,27 @@ impl Bridge {
             let _ = exited.await;
             self.exited = None;
         }
+    }
+}
+
+/// Sends the browser DevTools commands of the Helper's own, apart from any
+/// client's.
+#[derive(Clone)]
+pub(crate) struct Asker {
+    events: mpsc::UnboundedSender<Event>,
+}
+
+impl Asker {
+    /// Send a command and wait for its result.
+    pub async fn ask(&self, method: &str, params: Value) -> Result<Value, HelperError> {
+        let (answer, answered) = oneshot::channel();
+        self.events
+            .send(Event::Ask(method.to_owned(), params, answer))
+            .map_err(|_| HelperError::BrowserClosed)?;
+        answered
+            .await
+            .map_err(|_| HelperError::BrowserClosed)?
+            .map_err(HelperError::BrowserUnreachable)
     }
 }
 
@@ -92,6 +121,8 @@ enum Event {
     FromClient(u64, String),
     Disconnected(u64),
     Close,
+    /// A command of the Helper's own, answered with its result or error.
+    Ask(String, Value, oneshot::Sender<Result<Value, String>>),
 }
 
 #[derive(Clone)]
@@ -148,7 +179,7 @@ pub(crate) async fn start(browser: LaunchedBrowser) -> Result<Bridge, HelperErro
 
     let gate = Gate {
         secret: secret.clone(),
-        events,
+        events: events.clone(),
         next_client: Default::default(),
     };
     let router = Router::new()
@@ -165,6 +196,7 @@ pub(crate) async fn start(browser: LaunchedBrowser) -> Result<Bridge, HelperErro
         ws_url: format!("ws://{addr}/devtools/browser/{secret}"),
         close: Some(close),
         exited: Some(exited),
+        events,
         cancel,
     })
 }
@@ -226,6 +258,8 @@ struct Relay {
     pending: HashMap<u64, (u64, Value)>,
     next_id: u64,
     own_id: u64,
+    /// The Helper's own commands still waiting on the browser.
+    asked: HashMap<u64, oneshot::Sender<Result<Value, String>>>,
 }
 
 impl Relay {
@@ -236,6 +270,7 @@ impl Relay {
             pending: HashMap::new(),
             next_id: 0,
             own_id: OWN_IDS,
+            asked: HashMap::new(),
         }
     }
 
@@ -261,7 +296,13 @@ impl Relay {
                         self.release().await;
                     }
                 }
-                Event::Close => self.send_own("Browser.close", json!({}), None).await,
+                Event::Close => {
+                    self.send_own("Browser.close", json!({}), None).await;
+                }
+                Event::Ask(method, params, answer) => {
+                    let id = self.send_own(&method, params, None).await;
+                    self.asked.insert(id, answer);
+                }
                 Event::BrowserGone => break,
             }
         }
@@ -292,6 +333,14 @@ impl Relay {
             return;
         };
         if let Some(id) = message.get("id").and_then(Value::as_u64) {
+            if let Some(answer) = self.asked.remove(&id) {
+                let result = match message.get("error") {
+                    Some(error) => Err(error.to_string()),
+                    None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
+                };
+                let _ = answer.send(result);
+                return;
+            }
             // A reply: back to the client that asked, under its own id, and
             // to no one else.
             let Some((asker, own)) = self.pending.remove(&id) else {
@@ -401,13 +450,14 @@ impl Relay {
         .await;
     }
 
-    async fn send_own(&mut self, method: &str, params: Value, session: Option<&str>) {
+    async fn send_own(&mut self, method: &str, params: Value, session: Option<&str>) -> u64 {
         self.own_id += 1;
         let mut message = json!({ "id": self.own_id, "method": method, "params": params });
         if let Some(session) = session {
             message["sessionId"] = session.into();
         }
         let _ = self.to_pipe.send(message.to_string()).await;
+        self.own_id
     }
 }
 
@@ -558,6 +608,15 @@ mod pipe_tests {
             .await
             .unwrap();
         assert_eq!(next_text(&mut socket).await, big);
+
+        // The Helper's own commands are answered to the Helper, not the
+        // client. The echo browser answers with no result.
+        let answer = bridge
+            .asker()
+            .ask("Browser.getVersion", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(answer, Value::Null);
 
         // A web page (it sends an Origin) and a wrong secret get nowhere.
         let mut from_page = bridge.ws_url.as_str().into_client_request().unwrap();

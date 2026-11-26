@@ -211,7 +211,8 @@ mod tests {
     fn the_built_in_extension_is_loaded() {
         let extension = tempfile::tempdir().unwrap();
         std::fs::write(extension.path().join("manifest.json"), "{}").unwrap();
-        let mut command = BrowserCommand::new("/opt/cohelm/chromium", "/home/ada/.cohelm/profile");
+        let mut command =
+            BrowserCommand::new("chromium", std::env::temp_dir().join("cohelm-profile"));
         command.extension_dir = Some(extension.path().to_path_buf());
         command.validate().unwrap();
         let mut expected = OsString::from("--load-extension=");
@@ -221,8 +222,9 @@ mod tests {
 
     #[test]
     fn a_missing_extension_is_refused() {
-        let mut command = BrowserCommand::new("/opt/cohelm/chromium", "/home/ada/.cohelm/profile");
-        command.extension_dir = Some("/nowhere/extension".into());
+        let mut command =
+            BrowserCommand::new("chromium", std::env::temp_dir().join("cohelm-profile"));
+        command.extension_dir = Some(std::env::temp_dir().join("cohelm-no-such-extension"));
         assert!(matches!(command.validate(), Err(HelperError::Extension(_))));
     }
 

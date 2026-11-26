@@ -30,6 +30,8 @@ pub enum HelperError {
     BrowserUnreachable(String),
     #[error("lost the connection to Chrome DevTools MCP")]
     DevtoolsClosed,
+    #[error("Cohelm is already running: {0} is in use")]
+    AlreadyRunning(SocketAddr),
     #[error("the browser closed")]
     BrowserClosed,
     #[error(transparent)]
