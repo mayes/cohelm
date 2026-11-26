@@ -33,9 +33,8 @@ jobs:
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
-      # Temporary: the Mac runner's setup-chrome build can't start its child
-      # processes (MachPortRendezvous "Permission denied"), in port and pipe
-      # mode alike. Try Chrome for Testing, the build Puppeteer uses.
+      # On the Mac runner, the Chrome that setup-chrome installs can't start
+      # its own child processes, so the Mac tests use Chrome for Testing.
       - id: cft
         if: runner.os == 'macOS'
         shell: bash
@@ -45,24 +44,6 @@ jobs:
           line=$(printf '%s\n' "$out" | tail -n 1)
           # "chrome@<version> <path>"; the path has spaces in it.
           echo "path=${line#* }" >> "$GITHUB_OUTPUT"
-      - name: Mac Chrome launch check (temporary)
-        if: runner.os == 'macOS'
-        continue-on-error: true
-        shell: bash
-        env:
-          SETUP_CHROME: ${{ steps.chrome.outputs.chrome-path }}
-          CFT_CHROME: ${{ steps.cft.outputs.path }}
-        run: |
-          for name in SETUP_CHROME CFT_CHROME; do
-            chrome=${!name}
-            dir=$(mktemp -d)
-            "$chrome" --headless=new --no-first-run --user-data-dir="$dir" --remote-debugging-pipe about:blank 3</dev/null 4>/dev/null 2>"$dir/err" &
-            pid=$!
-            sleep 10
-            kill "$pid" 2>/dev/null || true
-            echo "== $name: rendezvous errors: $(grep -c MachPortRendezvous "$dir/err" || true), crashes: $(grep -c crashed "$dir/err" || true)"
-            codesign -dv "$(dirname "$(dirname "$(dirname "$chrome")")")" 2>&1 | grep -E "Identifier|TeamIdentifier|Signature" || true
-          done
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
